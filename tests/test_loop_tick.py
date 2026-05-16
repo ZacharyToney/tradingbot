@@ -45,6 +45,8 @@ class FakeBroker:
     equity: float = 100_000.0
     positions: list[PositionSnapshot] = field(default_factory=list)
     submitted: list[tuple] = field(default_factory=list)
+    # cid -> OrderResult, for use by `get_order_by_client_id` in sync tests
+    order_state: dict[str, OrderResult] = field(default_factory=dict)
 
     def get_account(self) -> AccountSnapshot:
         return AccountSnapshot(
@@ -68,6 +70,9 @@ class FakeBroker:
             filled_qty=0.0,
             filled_avg_price=None,
         )
+
+    def get_order_by_client_id(self, cid: str) -> OrderResult | None:
+        return self.order_state.get(cid)
 
 
 @dataclass
@@ -200,3 +205,80 @@ def test_tick_halt_file_blocks_orders(tmp_path: Path):
     assert any("halt" in r["reason"].lower() for r in rejects)
     assert db.execute("SELECT COUNT(*) AS c FROM orders").fetchone()["c"] == 0
     assert broker.submitted == []
+
+
+# ---- _sync_open_orders ----------------------------------------------------
+
+def _insert_order(db, cid, symbol, side, qty, status):
+    """Helper: stuff a row into orders for the sync tests."""
+    db.execute(
+        """INSERT INTO orders
+           (client_order_id, broker_order_id, strategy, symbol, side, qty,
+            order_type, limit_price, status, submitted_at_ms, updated_at_ms, reject_reason)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (cid, "bro-1", "donchian", symbol, side, qty,
+         "market", None, status, 0, 0, None),
+    )
+
+
+def test_sync_open_orders_noop_when_no_open_orders(tmp_path):
+    from tradingbot.live.loop import _sync_open_orders
+
+    db = connect(tmp_path / "tb.db")
+    _insert_order(db, "cid-A", "SOL/USD", "buy", 10.0, status="filled")  # already terminal
+    broker = FakeBroker()
+    n = _sync_open_orders(db, broker)
+    assert n == 0
+    # Status untouched
+    row = db.execute("SELECT status FROM orders WHERE client_order_id='cid-A'").fetchone()
+    assert row["status"] == "filled"
+
+
+def test_sync_open_orders_updates_status_and_inserts_fill(tmp_path):
+    from tradingbot.live.loop import _sync_open_orders
+
+    db = connect(tmp_path / "tb.db")
+    _insert_order(db, "cid-B", "SOL/USD", "buy", 10.0, status="pending_new")
+    broker = FakeBroker(order_state={
+        "cid-B": OrderResult(
+            client_order_id="cid-B", broker_order_id="bro-B",
+            status="filled", filled_qty=10.0, filled_avg_price=88.5,
+        ),
+    })
+    n = _sync_open_orders(db, broker)
+    assert n == 1
+    row = db.execute("SELECT status FROM orders WHERE client_order_id='cid-B'").fetchone()
+    assert row["status"] == "filled"
+    fill = db.execute("SELECT qty, price FROM fills WHERE client_order_id='cid-B'").fetchone()
+    assert fill is not None
+    assert fill["qty"] == 10.0
+    assert fill["price"] == 88.5
+
+
+def test_sync_open_orders_no_change_when_status_unchanged(tmp_path):
+    from tradingbot.live.loop import _sync_open_orders
+
+    db = connect(tmp_path / "tb.db")
+    _insert_order(db, "cid-C", "SOL/USD", "buy", 10.0, status="pending_new")
+    broker = FakeBroker(order_state={
+        "cid-C": OrderResult(
+            client_order_id="cid-C", broker_order_id="bro-C",
+            status="pending_new", filled_qty=0.0, filled_avg_price=None,
+        ),
+    })
+    n = _sync_open_orders(db, broker)
+    assert n == 0  # no state change
+    fills = db.execute("SELECT COUNT(*) AS c FROM fills").fetchone()
+    assert fills["c"] == 0
+
+
+def test_sync_open_orders_skips_when_broker_returns_none(tmp_path):
+    from tradingbot.live.loop import _sync_open_orders
+
+    db = connect(tmp_path / "tb.db")
+    _insert_order(db, "cid-D", "SOL/USD", "buy", 10.0, status="pending_new")
+    broker = FakeBroker()  # order_state empty → returns None
+    n = _sync_open_orders(db, broker)
+    assert n == 0
+    row = db.execute("SELECT status FROM orders WHERE client_order_id='cid-D'").fetchone()
+    assert row["status"] == "pending_new"  # untouched

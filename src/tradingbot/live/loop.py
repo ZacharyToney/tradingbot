@@ -185,6 +185,57 @@ def _snapshot_equity(db: sqlite3.Connection, broker: _BrokerLike) -> float:
 _OPEN_ORDER_STATUSES = ("new", "accepted", "pending_new", "partially_filled")
 
 
+def _sync_open_orders(db: sqlite3.Connection, broker) -> int:
+    """Reconcile our local `orders` table with the broker's view of any orders we
+    still consider open. Returns the number of orders whose status we changed.
+
+    For each in-flight cid, query the broker. If status changed, UPDATE orders.
+    If `filled_qty > 0` and no fill row yet, INSERT one — this is the only path
+    by which fills get recorded for orders that fill asynchronously (most of them).
+    """
+    placeholders = ",".join("?" * len(_OPEN_ORDER_STATUSES))
+    rows = db.execute(
+        f"""SELECT client_order_id, status, symbol, side
+            FROM orders
+            WHERE status IN ({placeholders})""",
+        _OPEN_ORDER_STATUSES,
+    ).fetchall()
+    changed = 0
+    for r in rows:
+        cid = r["client_order_id"]
+        result = broker.get_order_by_client_id(cid)
+        if result is None:
+            continue
+        if result.status == r["status"]:
+            continue
+        db.execute(
+            """UPDATE orders SET status = ?, broker_order_id = ?, updated_at_ms = ?
+               WHERE client_order_id = ?""",
+            (result.status, result.broker_order_id, utc_now_ms(), cid),
+        )
+        if result.filled_qty and result.filled_qty > 0 and result.filled_avg_price:
+            db.execute(
+                """INSERT OR IGNORE INTO fills
+                   (fill_id, client_order_id, symbol, side, qty, price, filled_at_ms)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    f"{result.broker_order_id}-1",
+                    cid,
+                    r["symbol"],
+                    r["side"],
+                    float(result.filled_qty),
+                    float(result.filled_avg_price),
+                    utc_now_ms(),
+                ),
+            )
+        logger.info(
+            f"sync order cid={cid} {r['status']} -> {result.status} "
+            f"filled={result.filled_qty}"
+        )
+        changed += 1
+    return changed
+
+
 def _bot_positions(
     db: sqlite3.Connection, strategy_name: str, symbols: list[str]
 ) -> dict[str, float]:
@@ -260,6 +311,9 @@ def tick(ctx: LiveContext) -> None:
     now = ctx.get_now()
 
     skew = ctx.get_skew()
+    # Refresh status of any in-flight orders BEFORE computing positions; this is
+    # how filled-after-submit orders get their fill rows recorded.
+    _sync_open_orders(ctx.db, ctx.broker)
     current_equity = _snapshot_equity(ctx.db, ctx.broker)
     starting_equity = _equity_for_sizing(ctx.db, ctx.broker)
 
