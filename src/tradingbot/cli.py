@@ -15,9 +15,11 @@ STRATEGY_REGISTRY = {}
 
 def _register_strategies() -> None:
     """Lazy registration to keep CLI startup fast and avoid import-time side effects."""
+    from tradingbot.strategies.donchian_breakout import DonchianBreakout
     from tradingbot.strategies.rsi2_mean_reversion import RSI2MeanReversion
 
     STRATEGY_REGISTRY["rsi2"] = RSI2MeanReversion
+    STRATEGY_REGISTRY["donchian"] = DonchianBreakout
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -29,12 +31,25 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("reconcile", help="Reconcile local DB state against broker")
 
     bt = sub.add_parser("backtest", help="Run a backtest")
-    bt.add_argument("strategy", choices=["rsi2"], help="Strategy name")
+    bt.add_argument("strategy", choices=["rsi2", "donchian"], help="Strategy name")
     bt.add_argument("--from", dest="start", required=True, help="YYYY-MM-DD inclusive")
     bt.add_argument("--to", dest="end", required=True, help="YYYY-MM-DD inclusive")
     bt.add_argument("--symbols", required=True, help="Comma-separated, e.g. SPY,QQQ")
     bt.add_argument("--equity", type=float, default=100_000.0)
     bt.add_argument("--slippage-bps", type=float, default=5.0)
+
+    wf = sub.add_parser("walkforward", help="Walk-forward parameter optimization")
+    wf.add_argument("strategy", choices=["rsi2", "donchian"])
+    wf.add_argument("--from", dest="start", required=True)
+    wf.add_argument("--to", dest="end", required=True)
+    wf.add_argument("--symbols", required=True)
+    wf.add_argument("--train-months", type=int, default=24)
+    wf.add_argument("--test-months", type=int, default=6)
+    wf.add_argument("--roll-months", type=int, default=6)
+    wf.add_argument(
+        "--objective", choices=["sharpe", "cagr", "profit_factor"], default="sharpe"
+    )
+    wf.add_argument("--equity", type=float, default=100_000.0)
 
     lv = sub.add_parser("live", help="Run the live paper-trading loop")
     mode = lv.add_mutually_exclusive_group()
@@ -70,6 +85,8 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_reconcile(settings)
     if args.cmd == "backtest":
         return _cmd_backtest(settings, args)
+    if args.cmd == "walkforward":
+        return _cmd_walkforward(settings, args)
     if args.cmd == "live":
         return _cmd_live(settings, args)
     return 0
@@ -172,6 +189,109 @@ def _cmd_backtest(settings, args) -> int:
         ret = result.equity_curve.iloc[-1] / result.equity_curve.iloc[0] - 1.0
         print(f"total_return:   {ret:.2%}")
     print(f"report:         {out_dir}")
+    return 0
+
+
+def _cmd_walkforward(settings, args) -> int:
+    from tradingbot.backtest.walkforward import ParamGrid, walk_forward, write_report
+    from tradingbot.data.bars import BarSource
+    from tradingbot.data.cache import load_bars
+
+    _register_strategies()
+    StrategyCls = STRATEGY_REGISTRY[args.strategy]
+
+    # Param grid per strategy. Small and conservative.
+    if args.strategy == "rsi2":
+        grid = ParamGrid(
+            strategy="rsi2",
+            grid={
+                "rsi_buy_threshold": [5.0, 10.0, 15.0],
+                "rsi_sell_threshold": [60.0, 70.0, 80.0],
+                "max_hold_bars": [3, 5, 7],
+                "trend_filter_window": [100, 150, 200],
+            },
+        )
+    else:  # donchian
+        grid = ParamGrid(
+            strategy="donchian",
+            grid={
+                "enter_window": [10, 20, 30, 55],
+                "exit_window": [5, 10, 20],
+            },
+        )
+
+    symbols = [s.strip() for s in args.symbols.split(",") if s.strip()]
+    start = datetime.fromisoformat(args.start).replace(tzinfo=UTC)
+    end = datetime.fromisoformat(args.end).replace(tzinfo=UTC)
+
+    source = BarSource(settings)
+    cache_dir = REPO_ROOT / "data" / "cache"
+    bars: dict = {}
+    # Use the strategy's natural timeframe (TF(1, "Day")).
+    tf = StrategyCls().timeframe
+    for symbol in symbols:
+        logger.info(f"loading bars symbol={symbol}")
+        df = load_bars(source, symbol, tf, start, end, cache_dir)
+        if df.empty:
+            logger.warning(f"no bars for {symbol}, skipping")
+            continue
+        bars[symbol] = df
+
+    if not bars:
+        print("no bars available for any symbol", file=sys.stderr)
+        return 3
+
+    logger.info(
+        f"walkforward strategy={args.strategy} train={args.train_months}mo "
+        f"test={args.test_months}mo roll={args.roll_months}mo objective={args.objective}"
+    )
+    result = walk_forward(
+        strategy_factory=StrategyCls,
+        grid=grid,
+        bars=bars,
+        train_months=args.train_months,
+        test_months=args.test_months,
+        roll_months=args.roll_months,
+        objective=args.objective,
+        starting_equity=args.equity,
+    )
+
+    out_dir = write_report(
+        result,
+        REPO_ROOT / "walkforward_reports",
+        extra={
+            "strategy": args.strategy,
+            "symbols": ",".join(bars.keys()),
+            "from": args.start,
+            "to": args.end,
+            "train_months": str(args.train_months),
+            "test_months": str(args.test_months),
+            "roll_months": str(args.roll_months),
+            "objective": args.objective,
+        },
+    )
+
+    print(f"\n=== {args.strategy} walk-forward ===")
+    print(f"windows: {len(result.windows)}")
+    if result.windows:
+        is_sharpe = [w.train_metrics.sharpe for w in result.windows]
+        oos_sharpe = [w.test_metrics.sharpe for w in result.windows]
+        is_mean = sum(is_sharpe) / len(is_sharpe)
+        oos_mean = sum(oos_sharpe) / len(oos_sharpe)
+        print(f"in-sample  Sharpe mean: {is_mean:.3f}")
+        print(f"out-of-sample Sharpe mean: {oos_mean:.3f}")
+        flag = result.overfit_flag()
+        if flag:
+            print("⚠  OVERFIT FLAG: OOS < 50% of IS — strategy may not generalize")
+        else:
+            print("✓  OOS ≥ 50% of IS — strategy generalizes acceptably")
+        print("\nper-window best params:")
+        for w in result.windows:
+            print(
+                f"  {w.test_start.date()}–{w.test_end.date()} "
+                f"params={w.best_params} oos_sharpe={w.test_metrics.sharpe:.3f}"
+            )
+    print(f"report: {out_dir}")
     return 0
 
 

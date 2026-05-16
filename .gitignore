@@ -16,6 +16,7 @@ wheels/
 logs/
 data/cache/
 backtest_reports/
+walkforward_reports/
 
 # Kill switch
 HALT
