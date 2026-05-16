@@ -45,6 +45,7 @@ CREATE TABLE IF NOT EXISTS signals (
     target_weight       REAL NOT NULL,
     note                TEXT,
     created_at_ms       INTEGER NOT NULL,
+    processed_at_ms     INTEGER,
     UNIQUE(strategy, symbol, bar_ts_ms)
 );
 
@@ -64,6 +65,26 @@ CREATE TABLE IF NOT EXISTS daytrades (
 );
 
 CREATE INDEX IF NOT EXISTS idx_daytrades_ts ON daytrades(closed_at_ms);
+
+CREATE TABLE IF NOT EXISTS starting_equity (
+    id                  INTEGER PRIMARY KEY CHECK (id = 1),
+    equity              REAL NOT NULL,
+    captured_at_ms      INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS gate_log (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    strategy            TEXT NOT NULL,
+    symbol              TEXT NOT NULL,
+    side                TEXT NOT NULL,
+    qty                 REAL NOT NULL,
+    decision            TEXT NOT NULL,        -- pass|reject
+    reason              TEXT,
+    bar_ts_ms           INTEGER NOT NULL,
+    created_at_ms       INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_gate_log_ts ON gate_log(created_at_ms);
 """
 
 

@@ -26,7 +26,7 @@ def main(argv: list[str] | None = None) -> int:
 
     sub.add_parser("status", help="Print account snapshot + open positions")
     sub.add_parser("halt", help="Touch HALT file to stop a running loop")
-    sub.add_parser("reconcile", help="Reconcile local DB state against broker (Phase 3)")
+    sub.add_parser("reconcile", help="Reconcile local DB state against broker")
 
     bt = sub.add_parser("backtest", help="Run a backtest")
     bt.add_argument("strategy", choices=["rsi2"], help="Strategy name")
@@ -35,6 +35,28 @@ def main(argv: list[str] | None = None) -> int:
     bt.add_argument("--symbols", required=True, help="Comma-separated, e.g. SPY,QQQ")
     bt.add_argument("--equity", type=float, default=100_000.0)
     bt.add_argument("--slippage-bps", type=float, default=5.0)
+
+    lv = sub.add_parser("live", help="Run the live paper-trading loop")
+    mode = lv.add_mutually_exclusive_group()
+    mode.add_argument("--paper", action="store_true", help="Use Alpaca paper account (default)")
+    mode.add_argument(
+        "--live", action="store_true", help="Use Alpaca live account (requires safety flag)"
+    )
+    lv.add_argument(
+        "--i-really-mean-live",
+        action="store_true",
+        help="Safety flag required to actually use --live (real money)",
+    )
+    lv.add_argument(
+        "--execute",
+        action="store_true",
+        help="Actually submit orders. Without this, runs in dry-run mode (no orders).",
+    )
+    lv.add_argument(
+        "--strategies",
+        default="rsi2",
+        help="Comma-separated list of strategy names to run (default: rsi2)",
+    )
 
     args = parser.parse_args(argv)
     settings = load_settings()
@@ -45,10 +67,11 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "halt":
         return _cmd_halt()
     if args.cmd == "reconcile":
-        print("reconcile: not implemented yet (Phase 3)")
-        return 1
+        return _cmd_reconcile(settings)
     if args.cmd == "backtest":
         return _cmd_backtest(settings, args)
+    if args.cmd == "live":
+        return _cmd_live(settings, args)
     return 0
 
 
@@ -150,6 +173,115 @@ def _cmd_backtest(settings, args) -> int:
         print(f"total_return:   {ret:.2%}")
     print(f"report:         {out_dir}")
     return 0
+
+
+def _cmd_reconcile(settings) -> int:
+    """Compare bot-tracked positions (sum of fills per strategy) against broker positions."""
+    from tradingbot.db import connect
+    from tradingbot.execution.broker import AlpacaBroker
+
+    db = connect(settings.db_full_path)
+    broker = AlpacaBroker(settings)
+
+    rows = db.execute(
+        """SELECT o.strategy,
+                  f.symbol,
+                  SUM(CASE WHEN f.side='buy' THEN f.qty ELSE -f.qty END) AS net_qty
+           FROM fills f JOIN orders o ON f.client_order_id = o.client_order_id
+           GROUP BY o.strategy, f.symbol HAVING net_qty != 0"""
+    ).fetchall()
+    bot_positions = [(r["strategy"], r["symbol"], r["net_qty"]) for r in rows]
+
+    broker_positions = {p.symbol: p.qty for p in broker.get_positions()}
+
+    print(f"bot-tracked positions ({len(bot_positions)}):")
+    for strat, sym, qty in bot_positions:
+        print(f"  {strat:>10} {sym:<10} qty={qty:.4f}")
+
+    print(f"\nbroker positions ({len(broker_positions)}):")
+    for sym, qty in broker_positions.items():
+        print(f"  {sym:<10} qty={qty:.4f}")
+
+    bot_sums: dict[str, float] = {}
+    for _, sym, qty in bot_positions:
+        bot_sums[sym] = bot_sums.get(sym, 0.0) + qty
+
+    drift = []
+    for sym in set(bot_sums) | set(broker_positions):
+        b = bot_sums.get(sym, 0.0)
+        br = broker_positions.get(sym, 0.0)
+        if abs(b - br) > 1e-6:
+            drift.append((sym, b, br))
+
+    if drift:
+        print("\nDRIFT DETECTED:")
+        for sym, b, br in drift:
+            print(f"  {sym}: bot={b:.4f} broker={br:.4f} delta={br-b:+.4f}")
+        return 1
+    print("\nno drift")
+    return 0
+
+
+def _cmd_live(settings, args) -> int:
+    from tradingbot.data.bars import BarSource
+    from tradingbot.db import connect
+    from tradingbot.execution.broker import AlpacaBroker
+    from tradingbot.live.loop import LiveContext, run_loop
+
+    use_live = bool(args.live)
+    if use_live:
+        if not args.i_really_mean_live:
+            print("--live requires --i-really-mean-live", file=sys.stderr)
+            return 2
+        if settings.trading_mode != "live":
+            print(
+                "--live requested but TRADING_MODE in .env is 'paper'. Refusing.",
+                file=sys.stderr,
+            )
+            return 2
+
+    _register_strategies()
+    strategy_names = [s.strip() for s in args.strategies.split(",") if s.strip()]
+    strategies = []
+    for name in strategy_names:
+        if name not in STRATEGY_REGISTRY:
+            print(f"unknown strategy: {name}", file=sys.stderr)
+            return 2
+        strategies.append(STRATEGY_REGISTRY[name]())
+
+    db = connect(settings.db_full_path)
+    broker = AlpacaBroker(settings)
+    bar_source = BarSource(settings)
+
+    universe = sorted({sym for s in strategies for sym in s.universe})
+    banner = (
+        f"\n{'='*60}\n"
+        f"tradingBot live loop\n"
+        f"  mode:              {settings.trading_mode}\n"
+        f"  execute:           {args.execute}\n"
+        f"  strategies:        {[s.name for s in strategies]}\n"
+        f"  universe:          {universe}\n"
+        f"  risk caps:         pos_pct={settings.max_position_pct} "
+        f"concur={settings.max_concurrent_positions} "
+        f"daily_loss={settings.daily_loss_limit_pct} "
+        f"total_dd={settings.total_dd_limit_pct}\n"
+        f"  poll_interval:     {settings.poll_interval_seconds}s\n"
+        f"  HALT file:         {REPO_ROOT}/HALT (touch to stop)\n"
+        f"{'='*60}\n"
+    )
+    print(banner)
+    logger.info(f"live loop start mode={settings.trading_mode} execute={args.execute}")
+
+    ctx = LiveContext(
+        settings=settings,
+        db=db,
+        broker=broker,
+        bar_source=bar_source,
+        strategies=strategies,
+        repo_root=REPO_ROOT,
+        dry_run=not args.execute,
+    )
+    return run_loop(ctx)
 
 
 if __name__ == "__main__":
