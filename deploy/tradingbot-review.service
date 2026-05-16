@@ -5,6 +5,7 @@ After=network-online.target
 
 [Service]
 Type=oneshot
+# %h = the running user's home directory. Adjust subpath if the repo lives elsewhere.
 WorkingDirectory=%h/code/tradingBot
 ExecStart=%h/code/tradingBot/scripts/post_week_review.sh
 StandardOutput=journal

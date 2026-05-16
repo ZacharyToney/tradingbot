@@ -5,7 +5,8 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-# Replace this path if the repo lives elsewhere on your machine.
+# %h is the running user's home directory. Adjust the repo subpath if you cloned
+# it somewhere other than ~/code/tradingBot.
 WorkingDirectory=%h/code/tradingBot
 # `tb` is installed via `uv tool install --editable .` into ~/.local/bin
 # --execute opts in to actually submitting paper orders; remove it for dry-run.

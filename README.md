@@ -4,7 +4,13 @@ Paper-first algorithmic trading bot on Alpaca (US equities + crypto). Rules-base
 technical strategies, hard risk caps, SQLite audit log. Real money is off until
 paper trading proves the loop is correct and the strategies have edge.
 
-See the approved plan: `~/.claude/plans/alright-use-my-current-jolly-manatee.md`.
+> Built as an AI pair-programming exercise with Claude Code. Architecture, design
+> tradeoffs, and engineering judgment were directed by me; Claude wrote substantial
+> portions of the code, tests, and documentation under that direction. All commits
+> are tagged `Co-Authored-By: Claude` for full transparency. The walk-forward
+> result honestly flags the strategies as overfit — this is a portfolio of
+> infrastructure quality, not a money printer.
+
 
 ## Quickstart
 

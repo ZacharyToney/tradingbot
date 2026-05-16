@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "Paper-first algorithmic trading bot on Alpaca (US equities + crypto)"
 readme = "README.md"
 authors = [
-    { name = "zacharytoney", email = "ZacharyToney@users.noreply.github.com" }
+    { name = "Zachary Toney" }
 ]
 requires-python = ">=3.11"
 dependencies = [
