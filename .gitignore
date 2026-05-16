@@ -13,6 +13,8 @@ wheels/
 .env
 *.db
 *.db-journal
+*.db-shm
+*.db-wal
 logs/
 data/cache/
 backtest_reports/

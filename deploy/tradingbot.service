@@ -1,0 +1,20 @@
+[Unit]
+Description=tradingBot paper-trading loop
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Replace this path if the repo lives elsewhere on your machine.
+WorkingDirectory=%h/code/tradingBot
+# `tb` is installed via `uv tool install --editable .` into ~/.local/bin
+# --execute opts in to actually submitting paper orders; remove it for dry-run.
+ExecStart=%h/.local/bin/tb live --paper --strategies rsi2,donchian --execute
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=tradingbot
+
+[Install]
+WantedBy=default.target
