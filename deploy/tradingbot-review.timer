@@ -1,0 +1,14 @@
+[Unit]
+Description=Run tradingBot post-week review every Friday at 17:00 ET
+
+[Timer]
+# Fires every Friday at 5:00 PM US Eastern (handles DST automatically — systemd
+# >= 252 supports timezone names in OnCalendar). First fire will be the next
+# Friday after enable.
+OnCalendar=Fri 17:00 America/New_York
+# If the system was off when the timer should have fired, run it on next boot.
+Persistent=true
+Unit=tradingbot-review.service
+
+[Install]
+WantedBy=timers.target

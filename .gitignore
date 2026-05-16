@@ -19,6 +19,7 @@ logs/
 data/cache/
 backtest_reports/
 walkforward_reports/
+reviews/
 
 # Kill switch
 HALT

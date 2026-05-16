@@ -93,22 +93,51 @@ without reinstalling.
 5. HALT works: `touch ~/code/tradingBot/HALT` → service exits within ~15s. Then `rm HALT`.
 6. Dashboard loads at http://localhost:8501 after `uv run streamlit run dashboard/app.py`.
 
-## Post-week review
+## Post-week review (automated)
 
-After 5 trading days running with `--execute`:
+A scheduled review fires every Friday at 17:00 ET. It runs
+`scripts/post_week_review.sh`, which writes a Markdown report to
+`reviews/week_YYYY-MM-DD.md` and pings via `notify-send`.
+
+### Install the timer
 
 ```sh
-# Snapshot the audit log
-cp ~/code/tradingBot/tradingbot.db ~/code/tradingBot/tradingbot_week1_$(date +%Y%m%d).db
+cp deploy/tradingbot-review.service ~/.config/systemd/user/
+cp deploy/tradingbot-review.timer   ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now tradingbot-review.timer
+systemctl --user list-timers tradingbot-review.timer   # confirm next fire
+```
 
-# Per-strategy trade count + net cash flow
+### What the report contains
+
+1. Latest commits on the repo
+2. Service health (`systemctl --user status tradingbot`)
+3. 7-day activity count from journalctl
+4. Errors / circuit-breaker trips
+5. `tb status` account snapshot
+6. `tb reconcile` drift check
+7. Per-strategy trade count + net cash flow, gate decision distribution, orders-by-status
+8. Snapshotted SQLite DB (`tradingbot_week_YYYY-MM-DD.db`)
+9. Most recent walk-forward summary for OOS-expectation comparison
+10. Manual cross-check reminder against Alpaca's paper UI + decision matrix
+
+### Run on demand
+
+```sh
+./scripts/post_week_review.sh
+# Report path is printed to stdout. Reports also written to reviews/.
+```
+
+### Manual SQL (if you ever need it directly)
+
+```sh
 sqlite3 ~/code/tradingBot/tradingbot.db <<'SQL'
 SELECT o.strategy, COUNT(*) AS trades,
        ROUND(SUM(CASE WHEN f.side='sell' THEN f.qty*f.price ELSE -f.qty*f.price END), 2) AS net_proceeds
 FROM fills f JOIN orders o ON f.client_order_id=o.client_order_id
 GROUP BY o.strategy;
 
--- Gate decisions distribution
 SELECT decision, COUNT(*) FROM gate_log GROUP BY decision;
 SQL
 ```
