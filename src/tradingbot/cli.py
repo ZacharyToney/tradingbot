@@ -312,6 +312,11 @@ def _cmd_reconcile(settings) -> int:
     ).fetchall()
     bot_positions = [(r["strategy"], r["symbol"], r["net_qty"]) for r in rows]
 
+    # Normalize symbols for comparison: Alpaca crypto comes back as "SOLUSD" but the
+    # bot tracks "SOL/USD". Strip "/" for the comparison key only.
+    def _canon(s: str) -> str:
+        return s.replace("/", "")
+
     broker_positions = {p.symbol: p.qty for p in broker.get_positions()}
 
     print(f"bot-tracked positions ({len(bot_positions)}):")
@@ -324,13 +329,17 @@ def _cmd_reconcile(settings) -> int:
 
     bot_sums: dict[str, float] = {}
     for _, sym, qty in bot_positions:
-        bot_sums[sym] = bot_sums.get(sym, 0.0) + qty
+        bot_sums[_canon(sym)] = bot_sums.get(_canon(sym), 0.0) + qty
+    broker_sums = {_canon(s): q for s, q in broker_positions.items()}
 
+    # Tolerate up to 1% absolute difference for crypto (fees + slippage on fills mean
+    # actual broker qty is slightly less than our recorded fill qty).
     drift = []
-    for sym in set(bot_sums) | set(broker_positions):
+    for sym in set(bot_sums) | set(broker_sums):
         b = bot_sums.get(sym, 0.0)
-        br = broker_positions.get(sym, 0.0)
-        if abs(b - br) > 1e-6:
+        br = broker_sums.get(sym, 0.0)
+        tol = max(0.01 * max(abs(b), abs(br)), 1e-6)
+        if abs(b - br) > tol:
             drift.append((sym, b, br))
 
     if drift:

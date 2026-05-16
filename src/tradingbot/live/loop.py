@@ -92,6 +92,45 @@ def _classify(symbol: str) -> AssetClass:
     return "crypto" if "/" in symbol else "equity"
 
 
+# Equity bar finalizes at 16:00 ET on its trade date. Crypto bar finalizes at the
+# next UTC midnight after its stamp. The live loop must NOT feed an unfinalized
+# bar to the strategy or it acts on partial-day data (look-ahead-like).
+_ET = "America/New_York"
+
+
+def _filter_to_complete_bars(
+    df: pd.DataFrame, now: datetime, asset_class: AssetClass
+) -> pd.DataFrame:
+    """Drop the last bar of `df` if it represents an in-progress period."""
+    if len(df) == 0:
+        return df
+    last = df.index[-1]
+    # Make sure last is tz-aware UTC for arithmetic with `now`.
+    if getattr(last, "tz", None) is None:
+        last = pd.Timestamp(last, tz="UTC")
+    now_ts = pd.Timestamp(now)
+    if asset_class == "crypto":
+        # Crypto daily bar stamped at start of UTC day; covers 24h. In progress if
+        # stamp + 1 day is still in the future relative to `now`.
+        if (last + pd.Timedelta(days=1)) > now_ts:
+            return df.iloc[:-1]
+        return df
+    # Equity: bar stamped at midnight ET of the trade date; finalizes at 16:00 ET
+    # that same date. In progress if last bar's ET-date == today's ET-date AND
+    # current ET time is before 16:00.
+    last_et = (
+        last.tz_convert(_ET) if last.tz is not None
+        else last.tz_localize("UTC").tz_convert(_ET)
+    )
+    now_et = (
+        now_ts.tz_convert(_ET) if now_ts.tz is not None
+        else now_ts.tz_localize("UTC").tz_convert(_ET)
+    )
+    if last_et.date() == now_et.date() and now_et.hour < 16:
+        return df.iloc[:-1]
+    return df
+
+
 def _equity_for_sizing(db: sqlite3.Connection, broker: _BrokerLike) -> float:
     row = db.execute("SELECT equity FROM starting_equity WHERE id = 1").fetchone()
     if row is not None:
@@ -143,17 +182,36 @@ def _snapshot_equity(db: sqlite3.Connection, broker: _BrokerLike) -> float:
     return float(acc.equity)
 
 
+_OPEN_ORDER_STATUSES = ("new", "accepted", "pending_new", "partially_filled")
+
+
 def _bot_positions(
     db: sqlite3.Connection, strategy_name: str, symbols: list[str]
 ) -> dict[str, float]:
-    """Sum fills for this strategy by symbol (buy adds, sell subtracts)."""
+    """Effective position = filled qty + in-flight (open, unfilled) order qty.
+
+    Including open orders prevents the reconciler from re-issuing the same intent
+    every tick while a previous order is still pending at the broker.
+    """
     positions: dict[str, float] = dict.fromkeys(symbols, 0.0)
+    # Filled qty (signed by side)
     rows = db.execute(
         """SELECT f.symbol, f.side, f.qty
            FROM fills f
            JOIN orders o ON f.client_order_id = o.client_order_id
            WHERE o.strategy = ?""",
         (strategy_name,),
+    ).fetchall()
+    for r in rows:
+        sign = 1.0 if r["side"] == "buy" else -1.0
+        positions[r["symbol"]] = positions.get(r["symbol"], 0.0) + sign * float(r["qty"])
+    # In-flight orders (placed at broker, not yet filled/cancelled/rejected).
+    placeholders = ",".join("?" * len(_OPEN_ORDER_STATUSES))
+    rows = db.execute(
+        f"""SELECT symbol, side, qty
+            FROM orders
+            WHERE strategy = ? AND status IN ({placeholders})""",
+        (strategy_name, *_OPEN_ORDER_STATUSES),
     ).fetchall()
     for r in rows:
         sign = 1.0 if r["side"] == "buy" else -1.0
@@ -225,6 +283,11 @@ def tick(ctx: LiveContext) -> None:
             )
             if df is None or df.empty:
                 logger.warning(f"no bars for {symbol}; skipping")
+                continue
+            # Drop any in-progress bar — strategy must see only finalized periods.
+            df = _filter_to_complete_bars(df, now, asset_classes[symbol])
+            if df.empty:
+                logger.warning(f"no completed bars for {symbol} yet; skipping")
                 continue
             # Strategy is a pure function of df[:t].
             sigs = strategy.generate_signals(symbol, df)

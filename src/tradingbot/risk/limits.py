@@ -26,10 +26,12 @@ def check_max_position_pct(order_value: float, equity: float, max_pct: float) ->
     if equity <= 0:
         return Decision(False, "max_position_pct: zero/negative equity")
     pct = order_value / equity
-    if pct > max_pct + 1e-9:
+    # Allow ~0.01% relative tolerance for float roundoff in `qty * price` calculations
+    # (sized exactly at cap can drift slightly above due to FP arithmetic).
+    if pct > max_pct * 1.0001:
         return Decision(
             False,
-            f"max_position_pct: order {pct:.4f} > cap {max_pct:.4f}",
+            f"max_position_pct: order {pct:.6f} > cap {max_pct:.6f}",
         )
     return Decision(True)
 

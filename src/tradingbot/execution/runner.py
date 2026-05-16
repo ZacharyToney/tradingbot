@@ -73,13 +73,15 @@ class OrderRunner:
             self._persist_order(order, status="dry_run", broker_order_id=None, reject_reason=None)
             return decision
 
-        # Live submit
+        # Live submit. Alpaca rejects "day" TIF for crypto — use GTC instead.
+        tif = "gtc" if order.asset_class == "crypto" else "day"
         try:
             result = self.broker.submit_market_order(
                 symbol=order.symbol,
                 side=order.side,
                 qty=order.qty,
                 client_order_id=order.client_order_id,
+                time_in_force=tif,
             )
         except Exception as e:
             logger.exception(f"broker submit failed: {e}")

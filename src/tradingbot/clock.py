@@ -51,15 +51,15 @@ def is_us_equity_market_open(now: datetime) -> bool:
 def last_completed_daily_bar_ts(now: datetime, asset_class: AssetClass) -> datetime:
     """Timestamp of the most recent CLOSED daily bar at `now`.
 
-    Equities: Alpaca daily bars are stamped to the bar's open in ET → expressed as
-              previous trading day's 04:00 UTC (Alpaca convention) for completed bars.
-              For v1 we just return UTC midnight of the most recent prior weekday.
-    Crypto:   24h bars roll at UTC midnight → return UTC midnight of today (if now > 0:00)
-              else previous UTC midnight.
+    Equities: Alpaca daily bars are stamped to midnight ET on their trade date.
+              Today's bar finalizes at 16:00 ET. Return UTC-midnight of bar_date.
+    Crypto:   Bars stamped at start of UTC day; finalize at the NEXT UTC midnight.
+              So at any time today, the last finalized bar started YESTERDAY.
     """
     if asset_class == "crypto":
         midnight_today = now.astimezone(UTC_TZ).replace(hour=0, minute=0, second=0, microsecond=0)
-        return midnight_today - timedelta(days=1) if now < midnight_today else midnight_today
+        # Always the bar that started yesterday and finished at today's UTC midnight.
+        return midnight_today - timedelta(days=1)
 
     # Equities
     et = now.astimezone(ET)
