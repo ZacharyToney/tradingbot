@@ -282,3 +282,69 @@ def test_sync_open_orders_skips_when_broker_returns_none(tmp_path):
     assert n == 0
     row = db.execute("SELECT status FROM orders WHERE client_order_id='cid-D'").fetchone()
     assert row["status"] == "pending_new"  # untouched
+
+
+# ---- _bot_positions ------------------------------------------------------
+
+def test_bot_positions_uses_broker_truth_for_filled_qty(tmp_path):
+    """Reads filled qty from the broker snapshot, NOT the fills table — this is the
+    fix for in-kind crypto fees where settled balance < submitted qty."""
+    from tradingbot.live.loop import _bot_positions
+
+    db = connect(tmp_path / "tb.db")
+    # Audit-log fill would say 56.058 (the qty the bot submitted), but broker shows 55.918.
+    # The function must return broker truth.
+    bot_positions = _bot_positions(
+        db,
+        strategy_name="donchian",
+        symbols=["SOL/USD", "BTC/USD"],
+        broker_positions_canon={"SOLUSD": 55.918, "BTCUSD": 0.0},
+    )
+    assert bot_positions == {"SOL/USD": 55.918, "BTC/USD": 0.0}
+
+
+def test_bot_positions_zero_when_broker_has_no_record(tmp_path):
+    from tradingbot.live.loop import _bot_positions
+
+    db = connect(tmp_path / "tb.db")
+    bot_positions = _bot_positions(
+        db,
+        strategy_name="rsi2",
+        symbols=["SPY", "QQQ"],
+        broker_positions_canon={},  # broker has nothing
+    )
+    assert bot_positions == {"SPY": 0.0, "QQQ": 0.0}
+
+
+def test_bot_positions_layers_in_flight_orders_on_top_of_broker_truth(tmp_path):
+    """Open (unfilled) orders count toward the effective position so the reconciler
+    doesn't re-issue the same buy/sell while a previous order is still pending."""
+    from tradingbot.live.loop import _bot_positions
+
+    db = connect(tmp_path / "tb.db")
+    # An in-flight buy of 18 AMZN at the broker, status=new.
+    _insert_order(db, "cid-amzn-1", "AMZN", "buy", 18.0, status="new")
+    # Broker shows no AMZN position yet (order hasn't filled).
+    bot_positions = _bot_positions(
+        db,
+        strategy_name="donchian",  # query is keyed by strategy
+        symbols=["AMZN"],
+        broker_positions_canon={"AMZN": 0.0},
+    )
+    # 0 broker + 18 in-flight = 18 effective.
+    assert bot_positions == {"AMZN": 18.0}
+
+
+def test_bot_positions_symbol_canonicalization_for_crypto(tmp_path):
+    """The broker returns 'SOLUSD' but the strategy/universe key is 'SOL/USD'.
+    canon_symbol() must bridge them."""
+    from tradingbot.live.loop import _bot_positions
+
+    db = connect(tmp_path / "tb.db")
+    bot_positions = _bot_positions(
+        db,
+        strategy_name="donchian",
+        symbols=["SOL/USD"],
+        broker_positions_canon={"SOLUSD": 42.5},  # Alpaca's form
+    )
+    assert bot_positions == {"SOL/USD": 42.5}

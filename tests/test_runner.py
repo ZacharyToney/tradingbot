@@ -146,3 +146,74 @@ def test_duplicate_client_order_id_does_not_double_persist(tmp_path):
 
     rows = runner.db.execute("SELECT client_order_id FROM orders").fetchall()
     assert len(rows) == 1
+
+
+def _sell_order(symbol: str = "SOL/USD", qty: float = 56.058) -> IntendedOrder:
+    return IntendedOrder(
+        strategy="donchian",
+        symbol=symbol,
+        side="sell",
+        qty=qty,
+        price=85.0,
+        asset_class="crypto",
+        bar_ts_ms=1_700_000_000_000,
+        client_order_id="cid-sell-1",
+    )
+
+
+def test_sell_clamp_reduces_qty_to_broker_balance(tmp_path):
+    """If reconciler asks to sell more SOL than the broker actually holds, the runner
+    clamps the submit qty down to what's available. Prevents Alpaca rejecting the
+    sell with 'insufficient balance' on in-kind-fee drift."""
+    settings = _settings()
+    broker = FakeBroker()
+    runner = OrderRunner(settings=settings, broker=broker, db=_conn(tmp_path), dry_run=False)
+
+    # Bot thinks it has 56.058 SOL (intended sell qty); broker says 55.918.
+    decision = runner.process_one(
+        _sell_order(qty=56.058),
+        _state(tmp_path),
+        broker_positions_canon={"SOLUSD": 55.918},
+    )
+    assert decision.allow
+    assert len(broker.calls) == 1
+    symbol, side, qty, _cid = broker.calls[0]
+    assert (symbol, side) == ("SOL/USD", "sell")
+    assert qty == 55.918  # clamped, not the original 56.058
+
+
+def test_sell_skipped_when_broker_has_no_position(tmp_path):
+    """Defensive: if the broker says we hold zero of the symbol, don't submit a sell
+    that will obviously reject. Persist a rejected row for the audit log instead."""
+    settings = _settings()
+    broker = FakeBroker()
+    runner = OrderRunner(settings=settings, broker=broker, db=_conn(tmp_path), dry_run=False)
+
+    decision = runner.process_one(
+        _sell_order(),
+        _state(tmp_path),
+        broker_positions_canon={},  # no SOL position
+    )
+    assert not decision.allow
+    assert broker.calls == []
+    row = runner.db.execute(
+        "SELECT status, reject_reason FROM orders WHERE client_order_id='cid-sell-1'"
+    ).fetchone()
+    assert row["status"] == "rejected"
+    assert "no broker position" in row["reject_reason"]
+
+
+def test_buy_not_affected_by_broker_positions(tmp_path):
+    """The sell-side clamp must not touch buy orders. Buys can size up freely; only
+    sells need protection from drift between recorded and actual balances."""
+    settings = _settings()
+    broker = FakeBroker()
+    runner = OrderRunner(settings=settings, broker=broker, db=_conn(tmp_path), dry_run=False)
+
+    runner.process_one(
+        _order(),  # SPY buy, qty=10
+        _state(tmp_path),
+        broker_positions_canon={"SPY": 0.0},  # no existing position
+    )
+    assert len(broker.calls) == 1
+    assert broker.calls[0][2] == 10.0  # qty unchanged

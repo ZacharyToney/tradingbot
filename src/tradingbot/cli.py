@@ -312,10 +312,7 @@ def _cmd_reconcile(settings) -> int:
     ).fetchall()
     bot_positions = [(r["strategy"], r["symbol"], r["net_qty"]) for r in rows]
 
-    # Normalize symbols for comparison: Alpaca crypto comes back as "SOLUSD" but the
-    # bot tracks "SOL/USD". Strip "/" for the comparison key only.
-    def _canon(s: str) -> str:
-        return s.replace("/", "")
+    from tradingbot.execution.broker import canon_symbol
 
     broker_positions = {p.symbol: p.qty for p in broker.get_positions()}
 
@@ -329,8 +326,8 @@ def _cmd_reconcile(settings) -> int:
 
     bot_sums: dict[str, float] = {}
     for _, sym, qty in bot_positions:
-        bot_sums[_canon(sym)] = bot_sums.get(_canon(sym), 0.0) + qty
-    broker_sums = {_canon(s): q for s, q in broker_positions.items()}
+        bot_sums[canon_symbol(sym)] = bot_sums.get(canon_symbol(sym), 0.0) + qty
+    broker_sums = {canon_symbol(s): q for s, q in broker_positions.items()}
 
     # Tolerate up to 1% absolute difference for crypto (fees + slippage on fills mean
     # actual broker qty is slightly less than our recorded fill qty).

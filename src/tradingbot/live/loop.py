@@ -237,25 +237,30 @@ def _sync_open_orders(db: sqlite3.Connection, broker) -> int:
 
 
 def _bot_positions(
-    db: sqlite3.Connection, strategy_name: str, symbols: list[str]
+    db: sqlite3.Connection,
+    strategy_name: str,
+    symbols: list[str],
+    broker_positions_canon: dict[str, float],
 ) -> dict[str, float]:
-    """Effective position = filled qty + in-flight (open, unfilled) order qty.
+    """Effective position = broker-reported filled qty + in-flight (unfilled) order qty.
 
-    Including open orders prevents the reconciler from re-issuing the same intent
+    Broker is canonical truth for what we currently hold — this avoids drift from
+    in-kind fees, rounding, or anything the audit log might have missed. In-flight
+    orders are layered on top so the reconciler doesn't re-issue the same intent
     every tick while a previous order is still pending at the broker.
+
+    `broker_positions_canon` is a dict keyed by canon_symbol (e.g. "SOLUSD") → signed
+    qty (positive = long, negative = short).
+
+    v1 caveat: for symbols owned by multiple strategies this would over-count. v1
+    strategies have disjoint universes (rsi2 = equities, donchian = crypto), so this
+    is fine. Add per-strategy attribution when a second equity strategy lands.
     """
-    positions: dict[str, float] = dict.fromkeys(symbols, 0.0)
-    # Filled qty (signed by side)
-    rows = db.execute(
-        """SELECT f.symbol, f.side, f.qty
-           FROM fills f
-           JOIN orders o ON f.client_order_id = o.client_order_id
-           WHERE o.strategy = ?""",
-        (strategy_name,),
-    ).fetchall()
-    for r in rows:
-        sign = 1.0 if r["side"] == "buy" else -1.0
-        positions[r["symbol"]] = positions.get(r["symbol"], 0.0) + sign * float(r["qty"])
+    from tradingbot.execution.broker import canon_symbol
+
+    positions: dict[str, float] = {
+        symbol: broker_positions_canon.get(canon_symbol(symbol), 0.0) for symbol in symbols
+    }
     # In-flight orders (placed at broker, not yet filled/cancelled/rejected).
     placeholders = ",".join("?" * len(_OPEN_ORDER_STATUSES))
     rows = db.execute(
@@ -317,6 +322,15 @@ def tick(ctx: LiveContext) -> None:
     current_equity = _snapshot_equity(ctx.db, ctx.broker)
     starting_equity = _equity_for_sizing(ctx.db, ctx.broker)
 
+    # Broker is source of truth for "what we currently hold". Snapshot once per
+    # tick, keyed by canonicalized symbol so "SOL/USD" universe lookups match
+    # Alpaca's "SOLUSD" return form.
+    from tradingbot.execution.broker import canon_symbol
+
+    broker_positions_canon: dict[str, float] = {
+        canon_symbol(p.symbol): float(p.qty) for p in ctx.broker.get_positions()
+    }
+
     for strategy in ctx.strategies:
         universe = ctx.universe_override or strategy.universe
         # For v1 we treat all strategies as daily.
@@ -368,7 +382,9 @@ def tick(ctx: LiveContext) -> None:
             logger.info(f"market_closed asset_class={ac} — signals recorded, no orders this tick")
             continue
 
-        positions = _bot_positions(ctx.db, strategy.name, list(targets))
+        positions = _bot_positions(
+            ctx.db, strategy.name, list(targets), broker_positions_canon
+        )
         orders = reconcile(
             targets=targets,
             bot_positions=positions,
@@ -404,7 +420,7 @@ def tick(ctx: LiveContext) -> None:
                 now=now,
                 repo_root=ctx.repo_root,
             )
-            runner.process_one(order, state)
+            runner.process_one(order, state, broker_positions_canon)
 
         for symbol in targets:
             _mark_signal_processed(ctx.db, strategy.name, symbol, bar_ts_ms)

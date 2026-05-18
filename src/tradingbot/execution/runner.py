@@ -43,7 +43,12 @@ class OrderRunner:
         self.db = db
         self.dry_run = dry_run
 
-    def process_one(self, order: IntendedOrder, state: AccountState) -> Decision:
+    def process_one(
+        self,
+        order: IntendedOrder,
+        state: AccountState,
+        broker_positions_canon: dict[str, float] | None = None,
+    ) -> Decision:
         decision = pre_trade(order, state, self.settings)
         self._log_gate(order, decision)
 
@@ -65,10 +70,37 @@ class OrderRunner:
             )
             return decision
 
+        # Sell-side clamp: never ask the broker to sell more than it actually holds.
+        # Protects against drift between recorded fills and real balance (in-kind fees,
+        # external transfers, etc.). The reconciler computes qty from bot_positions,
+        # which is already broker-truth-backed, but defending here too is cheap.
+        submit_qty = order.qty
+        if order.side == "sell" and broker_positions_canon is not None:
+            from tradingbot.execution.broker import canon_symbol
+            broker_qty = broker_positions_canon.get(canon_symbol(order.symbol), 0.0)
+            if broker_qty <= 0:
+                logger.warning(
+                    f"sell skipped: broker has no long position for {order.symbol} "
+                    f"(intended qty={order.qty}). cid={order.client_order_id}"
+                )
+                self._persist_order(
+                    order,
+                    status="rejected",
+                    broker_order_id=None,
+                    reject_reason="no broker position to sell",
+                )
+                return Decision(False, "no broker position to sell")
+            if broker_qty < submit_qty:
+                logger.info(
+                    f"sell qty clamp: intended={order.qty} broker_qty={broker_qty} "
+                    f"cid={order.client_order_id}"
+                )
+                submit_qty = broker_qty
+
         if self.dry_run:
             logger.info(
                 f"dry_run order strategy={order.strategy} symbol={order.symbol} "
-                f"side={order.side} qty={order.qty} cid={order.client_order_id}"
+                f"side={order.side} qty={submit_qty} cid={order.client_order_id}"
             )
             self._persist_order(order, status="dry_run", broker_order_id=None, reject_reason=None)
             return decision
@@ -79,7 +111,7 @@ class OrderRunner:
             result = self.broker.submit_market_order(
                 symbol=order.symbol,
                 side=order.side,
-                qty=order.qty,
+                qty=submit_qty,
                 client_order_id=order.client_order_id,
                 time_in_force=tif,
             )

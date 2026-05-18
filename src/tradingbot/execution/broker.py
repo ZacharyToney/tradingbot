@@ -11,6 +11,16 @@ from loguru import logger
 from tradingbot.config import Settings
 
 
+def canon_symbol(s: str) -> str:
+    """Normalize a symbol for cross-source comparison.
+
+    Alpaca returns crypto as "SOLUSD" but the bot tracks "SOL/USD" everywhere else
+    (strategy universes, signals, fills, intended orders). Strip "/" so both shapes
+    map to the same key.
+    """
+    return s.replace("/", "")
+
+
 @dataclass(frozen=True)
 class AccountSnapshot:
     equity: float
