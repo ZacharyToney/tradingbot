@@ -10,7 +10,7 @@ from pathlib import Path
 
 from tradingbot.config import Settings
 from tradingbot.db import connect
-from tradingbot.execution.broker import OrderResult
+from tradingbot.execution.broker import OrderResult, Quote
 from tradingbot.execution.runner import OrderRunner
 from tradingbot.risk.gates import AccountState, IntendedOrder
 
@@ -66,6 +66,7 @@ def _order() -> IntendedOrder:
 class FakeBroker:
     calls: list[tuple] = None
     next_result: OrderResult = None
+    next_quote: Quote | None = None
 
     def __post_init__(self):
         self.calls = []
@@ -81,6 +82,9 @@ class FakeBroker:
             filled_qty=0.0,
             filled_avg_price=None,
         )
+
+    def get_latest_quote(self, symbol: str) -> Quote | None:
+        return self.next_quote
 
 
 def _conn(tmp_path: Path) -> sqlite3.Connection:
@@ -201,6 +205,62 @@ def test_sell_skipped_when_broker_has_no_position(tmp_path):
     ).fetchone()
     assert row["status"] == "rejected"
     assert "no broker position" in row["reject_reason"]
+
+
+def test_quote_captured_at_submit_persists_to_orders_row(tmp_path):
+    settings = _settings()
+    broker = FakeBroker()
+    broker.next_quote = Quote(bid=99.95, ask=100.05, bid_size=10, ask_size=10, ts_ms=1234567)
+    runner = OrderRunner(settings=settings, broker=broker, db=_conn(tmp_path), dry_run=False)
+
+    runner.process_one(_order(), _state(tmp_path))
+
+    row = runner.db.execute(
+        "SELECT quote_bid, quote_ask, quote_ts_ms, intended_price FROM orders "
+        "WHERE client_order_id='cid-fixed-1'"
+    ).fetchone()
+    assert row["quote_bid"] == 99.95
+    assert row["quote_ask"] == 100.05
+    assert row["quote_ts_ms"] == 1234567
+    assert row["intended_price"] == 100.0  # from IntendedOrder.price
+
+
+def test_quote_unavailable_does_not_block_submit(tmp_path):
+    """If the quote endpoint fails, store NULL for the quote fields but still submit
+    the order. Measurement is secondary; trades go through."""
+    settings = _settings()
+    broker = FakeBroker()
+    broker.next_quote = None  # quote unavailable
+    runner = OrderRunner(settings=settings, broker=broker, db=_conn(tmp_path), dry_run=False)
+
+    decision = runner.process_one(_order(), _state(tmp_path))
+    assert decision.allow
+    assert len(broker.calls) == 1  # order still submitted
+
+    row = runner.db.execute(
+        "SELECT quote_bid, quote_ask, intended_price FROM orders "
+        "WHERE client_order_id='cid-fixed-1'"
+    ).fetchone()
+    assert row["quote_bid"] is None
+    assert row["quote_ask"] is None
+    assert row["intended_price"] == 100.0  # still captured from bar close
+
+
+def test_dry_run_also_captures_quote(tmp_path):
+    """Dry-run path needs quote capture too so slippage research includes counterfactuals."""
+    settings = _settings()
+    broker = FakeBroker()
+    broker.next_quote = Quote(bid=99.5, ask=100.5, bid_size=5, ask_size=5, ts_ms=999)
+    runner = OrderRunner(settings=settings, broker=broker, db=_conn(tmp_path), dry_run=True)
+
+    runner.process_one(_order(), _state(tmp_path))
+
+    row = runner.db.execute(
+        "SELECT status, quote_bid, quote_ask FROM orders WHERE client_order_id='cid-fixed-1'"
+    ).fetchone()
+    assert row["status"] == "dry_run"
+    assert row["quote_bid"] == 99.5
+    assert row["quote_ask"] == 100.5
 
 
 def test_buy_not_affected_by_broker_positions(tmp_path):

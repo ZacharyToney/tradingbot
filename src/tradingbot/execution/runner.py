@@ -14,7 +14,7 @@ from loguru import logger
 
 from tradingbot.clock import utc_now_ms
 from tradingbot.config import Settings
-from tradingbot.execution.broker import OrderResult
+from tradingbot.execution.broker import OrderResult, Quote
 from tradingbot.risk.gates import AccountState, IntendedOrder, pre_trade
 from tradingbot.risk.limits import Decision
 
@@ -28,6 +28,8 @@ class _BrokerLike(Protocol):
         client_order_id: str,
         time_in_force: str = "day",
     ) -> OrderResult: ...
+
+    def get_latest_quote(self, symbol: str) -> Quote | None: ...
 
 
 class OrderRunner:
@@ -88,6 +90,7 @@ class OrderRunner:
                     status="rejected",
                     broker_order_id=None,
                     reject_reason="no broker position to sell",
+                    quote=None,
                 )
                 return Decision(False, "no broker position to sell")
             if broker_qty < submit_qty:
@@ -97,12 +100,21 @@ class OrderRunner:
                 )
                 submit_qty = broker_qty
 
+        # Quote snapshot for slippage measurement. Best-effort — never block a trade.
+        quote: Quote | None = None
+        try:
+            quote = self.broker.get_latest_quote(order.symbol)
+        except Exception as e:  # belt-and-suspenders; broker already swallows
+            logger.warning(f"get_latest_quote raised unexpectedly: {e}")
+
         if self.dry_run:
             logger.info(
                 f"dry_run order strategy={order.strategy} symbol={order.symbol} "
                 f"side={order.side} qty={submit_qty} cid={order.client_order_id}"
             )
-            self._persist_order(order, status="dry_run", broker_order_id=None, reject_reason=None)
+            self._persist_order(
+                order, status="dry_run", broker_order_id=None, reject_reason=None, quote=quote,
+            )
             return decision
 
         # Live submit. Alpaca rejects "day" TIF for crypto — use GTC instead.
@@ -122,6 +134,7 @@ class OrderRunner:
                 status="rejected",
                 broker_order_id=None,
                 reject_reason=str(e)[:500],
+                quote=quote,
             )
             return Decision(False, f"broker error: {e}")
 
@@ -130,6 +143,7 @@ class OrderRunner:
             status=result.status,
             broker_order_id=result.broker_order_id,
             reject_reason=None,
+            quote=quote,
         )
         if result.filled_qty and result.filled_qty > 0 and result.filled_avg_price:
             self._persist_fill(order, result)
@@ -159,14 +173,15 @@ class OrderRunner:
         status: str,
         broker_order_id: str | None,
         reject_reason: str | None,
+        quote: Quote | None = None,
     ) -> None:
         now = utc_now_ms()
         self.db.execute(
             """INSERT INTO orders
                (client_order_id, broker_order_id, strategy, symbol, side, qty,
                 order_type, limit_price, status, submitted_at_ms, updated_at_ms,
-                reject_reason)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                reject_reason, quote_bid, quote_ask, quote_ts_ms, intended_price)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 order.client_order_id,
                 broker_order_id,
@@ -180,6 +195,10 @@ class OrderRunner:
                 now,
                 now,
                 reject_reason,
+                quote.bid if quote else None,
+                quote.ask if quote else None,
+                quote.ts_ms if quote else None,
+                order.price,
             ),
         )
 

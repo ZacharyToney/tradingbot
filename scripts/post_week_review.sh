@@ -109,13 +109,25 @@ SQL
     echo '```'
     echo
 
-    echo "## 8. Audit-log snapshot"
+    echo "## 8. Trading costs (realized slippage + fees)"
+    echo
+    echo '```'
+    WEEK_START="$(date -d '7 days ago' +%Y-%m-%d 2>/dev/null || date -v-7d +%Y-%m-%d)"
+    (cd "$REPO" && tb cost-report --from "$WEEK_START" --to "$DATE" 2>&1)
+    echo '```'
+    echo
+    echo "Compare the overall median bps to the backtest's 5 bps assumption. If realized"
+    echo "is materially higher (say > 15 bps), backtests are optimistic and OOS results"
+    echo "need re-evaluation before any live-capital decision."
+    echo
+
+    echo "## 9. Audit-log snapshot"
     echo
     SNAPSHOT="$REPO/tradingbot_week_${DATE}.db"
     cp "$REPO/tradingbot.db" "$SNAPSHOT" 2>&1 && echo "Snapshotted to: \`$SNAPSHOT\`"
     echo
 
-    echo "## 9. Walk-forward context (most recent)"
+    echo "## 10. Walk-forward context (most recent)"
     echo
     WF="$(ls -td "$REPO"/walkforward_reports/donchian_* 2>/dev/null | head -1)"
     if [ -n "$WF" ] && [ -f "$WF/summary.txt" ]; then
@@ -128,7 +140,7 @@ SQL
     fi
     echo
 
-    echo "## 10. Manual next step"
+    echo "## 11. Manual next step"
     echo
     echo "Cross-check the per-strategy \`net_cashflow\` numbers above against the Alpaca paper UI:"
     echo

@@ -30,6 +30,14 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("halt", help="Touch HALT file to stop a running loop")
     sub.add_parser("reconcile", help="Reconcile local DB state against broker")
 
+    cr = sub.add_parser(
+        "cost-report",
+        help="Aggregate realized slippage + in-kind fees from the orders table",
+    )
+    cr.add_argument("--from", dest="start", default=None, help="YYYY-MM-DD inclusive")
+    cr.add_argument("--to", dest="end", default=None, help="YYYY-MM-DD inclusive")
+    cr.add_argument("--strategy", default=None, help="Filter to one strategy (rsi2|donchian)")
+
     bt = sub.add_parser("backtest", help="Run a backtest")
     bt.add_argument("strategy", choices=["rsi2", "donchian"], help="Strategy name")
     bt.add_argument("--from", dest="start", required=True, help="YYYY-MM-DD inclusive")
@@ -83,6 +91,8 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_halt()
     if args.cmd == "reconcile":
         return _cmd_reconcile(settings)
+    if args.cmd == "cost-report":
+        return _cmd_cost_report(settings, args)
     if args.cmd == "backtest":
         return _cmd_backtest(settings, args)
     if args.cmd == "walkforward":
@@ -345,6 +355,81 @@ def _cmd_reconcile(settings) -> int:
             print(f"  {sym}: bot={b:.4f} broker={br:.4f} delta={br-b:+.4f}")
         return 1
     print("\nno drift")
+    return 0
+
+
+def _cmd_cost_report(settings, args) -> int:
+    """Aggregate realized slippage + in-kind fees from the orders table.
+
+    Output: per-(strategy, asset_class) median + p90 slippage (bps), total fee in $,
+    plus a one-line gap-vs-5bps-assumption summary.
+    """
+    from statistics import median
+
+    from tradingbot.db import connect
+
+    db = connect(settings.db_full_path)
+
+    where_clauses = ["realized_slippage_bps IS NOT NULL"]
+    params: list = []
+    if args.start:
+        start_ms = int(datetime.fromisoformat(args.start).replace(tzinfo=UTC).timestamp() * 1000)
+        where_clauses.append("submitted_at_ms >= ?")
+        params.append(start_ms)
+    if args.end:
+        end_ms = int(datetime.fromisoformat(args.end).replace(tzinfo=UTC).timestamp() * 1000)
+        # Inclusive end-of-day
+        end_ms += 24 * 60 * 60 * 1000
+        where_clauses.append("submitted_at_ms < ?")
+        params.append(end_ms)
+    if args.strategy:
+        where_clauses.append("strategy = ?")
+        params.append(args.strategy)
+
+    sql = (
+        "SELECT strategy, symbol, side, realized_slippage_bps, fee_qty, qty, intended_price "
+        f"FROM orders WHERE {' AND '.join(where_clauses)}"
+    )
+    rows = db.execute(sql, params).fetchall()
+
+    if not rows:
+        print("no filled orders with measured slippage in this range")
+        return 0
+
+    # Group by (strategy, asset_class).
+    def _asset_class(symbol: str) -> str:
+        return "crypto" if "/" in symbol else "equity"
+
+    groups: dict[tuple[str, str], dict] = {}
+    for r in rows:
+        key = (r["strategy"], _asset_class(r["symbol"]))
+        g = groups.setdefault(key, {"slip": [], "fee_usd": 0.0, "n": 0})
+        g["slip"].append(float(r["realized_slippage_bps"]))
+        # fee_qty is in base asset for crypto. Multiply by intended price for $ value.
+        if r["fee_qty"] and r["intended_price"]:
+            g["fee_usd"] += float(r["fee_qty"]) * float(r["intended_price"])
+        g["n"] += 1
+
+    print("\n=== cost report ===")
+    print(f"{'strategy':<12}{'asset':<8}{'n':>5}{'median_bps':>14}{'p90_bps':>12}{'fee_$':>12}")
+    print("-" * 65)
+    weighted_median: list[float] = []
+    for (strat, asset), g in sorted(groups.items()):
+        slips = g["slip"]
+        med = median(slips)
+        p90 = sorted(slips)[max(0, int(0.9 * len(slips)) - 1)] if len(slips) > 1 else slips[0]
+        print(
+            f"{strat:<12}{asset:<8}{g['n']:>5}{med:>14.1f}{p90:>12.1f}{g['fee_usd']:>12.2f}"
+        )
+        weighted_median.extend(slips)
+
+    if weighted_median:
+        overall = median(weighted_median)
+        gap = overall - 5.0
+        print(
+            f"\noverall median slippage: {overall:.1f} bps "
+            f"(backtest assumes 5.0 bps; gap {gap:+.1f})"
+        )
     return 0
 
 

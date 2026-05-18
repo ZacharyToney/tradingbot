@@ -185,17 +185,41 @@ def _snapshot_equity(db: sqlite3.Connection, broker: _BrokerLike) -> float:
 _OPEN_ORDER_STATUSES = ("new", "accepted", "pending_new", "partially_filled")
 
 
-def _sync_open_orders(db: sqlite3.Connection, broker) -> int:
+def _compute_slippage_bps(
+    side: str, filled_avg_price: float, quote_bid: float | None, quote_ask: float | None
+) -> float | None:
+    """Realized slippage vs the captured quote, in basis points. Positive = worse than market.
+
+    Buys are compared to ask (the price we'd have had to hit on a marketable order); sells
+    are compared to bid. Returns None if the relevant side of the quote is missing.
+    """
+    reference = quote_ask if side == "buy" else quote_bid
+    if reference is None or reference <= 0:
+        return None
+    sign = 1.0 if side == "buy" else -1.0
+    return sign * (filled_avg_price - reference) / reference * 10000.0
+
+
+def _sync_open_orders(
+    db: sqlite3.Connection,
+    broker,
+    broker_positions_canon: dict[str, float] | None = None,
+) -> int:
     """Reconcile our local `orders` table with the broker's view of any orders we
     still consider open. Returns the number of orders whose status we changed.
 
     For each in-flight cid, query the broker. If status changed, UPDATE orders.
     If `filled_qty > 0` and no fill row yet, INSERT one — this is the only path
     by which fills get recorded for orders that fill asynchronously (most of them).
+
+    When the status transitions to `filled` AND we have a captured quote, compute
+    realized slippage and detect in-kind crypto fees, persisting both for cost analysis.
     """
+    from tradingbot.execution.broker import canon_symbol
+
     placeholders = ",".join("?" * len(_OPEN_ORDER_STATUSES))
     rows = db.execute(
-        f"""SELECT client_order_id, status, symbol, side
+        f"""SELECT client_order_id, status, symbol, side, quote_bid, quote_ask
             FROM orders
             WHERE status IN ({placeholders})""",
         _OPEN_ORDER_STATUSES,
@@ -208,10 +232,45 @@ def _sync_open_orders(db: sqlite3.Connection, broker) -> int:
             continue
         if result.status == r["status"]:
             continue
+
+        # Status changed — compute cost-tracking fields if the order just filled.
+        realized_slippage_bps: float | None = None
+        fee_qty: float | None = None
+        filled_at_ms: int | None = None
+        if result.status == "filled" and result.filled_qty and result.filled_avg_price:
+            realized_slippage_bps = _compute_slippage_bps(
+                r["side"], float(result.filled_avg_price), r["quote_bid"], r["quote_ask"]
+            )
+            # Broker doesn't expose a precise fill_at; sync time is the upper bound.
+            filled_at_ms = utc_now_ms()
+            # In-kind fee detection: only crypto buys take fee in base asset. For a buy
+            # from flat with single-strategy-per-symbol (v1 assumption), fee = intended
+            # filled qty - actual broker-settled qty.
+            is_crypto = "/" in r["symbol"]
+            if is_crypto and r["side"] == "buy" and broker_positions_canon is not None:
+                broker_qty = broker_positions_canon.get(canon_symbol(r["symbol"]), 0.0)
+                # filled_qty is what Alpaca booked; broker_qty is what settled after fee.
+                gap = float(result.filled_qty) - broker_qty
+                # clamp negative to 0 (preexisting position would flip the sign)
+                fee_qty = max(0.0, gap)
+            else:
+                fee_qty = 0.0
+
         db.execute(
-            """UPDATE orders SET status = ?, broker_order_id = ?, updated_at_ms = ?
+            """UPDATE orders SET status = ?, broker_order_id = ?, updated_at_ms = ?,
+                 realized_slippage_bps = COALESCE(?, realized_slippage_bps),
+                 fee_qty = COALESCE(?, fee_qty),
+                 filled_at_ms = COALESCE(?, filled_at_ms)
                WHERE client_order_id = ?""",
-            (result.status, result.broker_order_id, utc_now_ms(), cid),
+            (
+                result.status,
+                result.broker_order_id,
+                utc_now_ms(),
+                realized_slippage_bps,
+                fee_qty,
+                filled_at_ms,
+                cid,
+            ),
         )
         if result.filled_qty and result.filled_qty > 0 and result.filled_avg_price:
             db.execute(
@@ -228,9 +287,15 @@ def _sync_open_orders(db: sqlite3.Connection, broker) -> int:
                     utc_now_ms(),
                 ),
             )
+        slip_str = (
+            f" slip_bps={realized_slippage_bps:.1f}"
+            if realized_slippage_bps is not None
+            else ""
+        )
+        fee_str = f" fee_qty={fee_qty:.6f}" if fee_qty else ""
         logger.info(
             f"sync order cid={cid} {r['status']} -> {result.status} "
-            f"filled={result.filled_qty}"
+            f"filled={result.filled_qty}{slip_str}{fee_str}"
         )
         changed += 1
     return changed
@@ -316,9 +381,6 @@ def tick(ctx: LiveContext) -> None:
     now = ctx.get_now()
 
     skew = ctx.get_skew()
-    # Refresh status of any in-flight orders BEFORE computing positions; this is
-    # how filled-after-submit orders get their fill rows recorded.
-    _sync_open_orders(ctx.db, ctx.broker)
     current_equity = _snapshot_equity(ctx.db, ctx.broker)
     starting_equity = _equity_for_sizing(ctx.db, ctx.broker)
 
@@ -330,6 +392,12 @@ def tick(ctx: LiveContext) -> None:
     broker_positions_canon: dict[str, float] = {
         canon_symbol(p.symbol): float(p.qty) for p in ctx.broker.get_positions()
     }
+
+    # Refresh status of any in-flight orders BEFORE computing positions; this is
+    # how filled-after-submit orders get their fill rows recorded. Pass the broker
+    # snapshot so the sync can detect in-kind crypto fees at the moment we observe
+    # a fill (current broker qty vs the qty Alpaca says it filled).
+    _sync_open_orders(ctx.db, ctx.broker, broker_positions_canon)
 
     for strategy in ctx.strategies:
         universe = ctx.universe_override or strategy.universe

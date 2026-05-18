@@ -209,15 +209,16 @@ def test_tick_halt_file_blocks_orders(tmp_path: Path):
 
 # ---- _sync_open_orders ----------------------------------------------------
 
-def _insert_order(db, cid, symbol, side, qty, status):
+def _insert_order(db, cid, symbol, side, qty, status, quote_bid=None, quote_ask=None):
     """Helper: stuff a row into orders for the sync tests."""
     db.execute(
         """INSERT INTO orders
            (client_order_id, broker_order_id, strategy, symbol, side, qty,
-            order_type, limit_price, status, submitted_at_ms, updated_at_ms, reject_reason)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            order_type, limit_price, status, submitted_at_ms, updated_at_ms, reject_reason,
+            quote_bid, quote_ask)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (cid, "bro-1", "donchian", symbol, side, qty,
-         "market", None, status, 0, 0, None),
+         "market", None, status, 0, 0, None, quote_bid, quote_ask),
     )
 
 
@@ -282,6 +283,114 @@ def test_sync_open_orders_skips_when_broker_returns_none(tmp_path):
     assert n == 0
     row = db.execute("SELECT status FROM orders WHERE client_order_id='cid-D'").fetchone()
     assert row["status"] == "pending_new"  # untouched
+
+
+# ---- slippage + fee computation in _sync_open_orders ---------------------
+
+def test_sync_fill_computes_slippage_for_buy_against_ask(tmp_path):
+    """Buy filled above ask → positive slippage (paid worse than market)."""
+    from tradingbot.live.loop import _sync_open_orders
+
+    db = connect(tmp_path / "tb.db")
+    _insert_order(db, "cid-buy-1", "SPY", "buy", 10.0, status="pending_new",
+                  quote_bid=99.95, quote_ask=100.00)
+    broker = FakeBroker(order_state={
+        "cid-buy-1": OrderResult(
+            client_order_id="cid-buy-1", broker_order_id="bro-buy-1",
+            status="filled", filled_qty=10.0, filled_avg_price=100.05,
+        ),
+    })
+    _sync_open_orders(db, broker)
+    row = db.execute(
+        "SELECT realized_slippage_bps, fee_qty FROM orders WHERE client_order_id='cid-buy-1'"
+    ).fetchone()
+    # (100.05 - 100.00) / 100.00 * 10000 = 5.0 bps, positive sign for buy
+    assert abs(row["realized_slippage_bps"] - 5.0) < 1e-6
+    assert row["fee_qty"] == 0.0  # equity, no fee
+
+
+def test_sync_fill_computes_slippage_for_sell_against_bid(tmp_path):
+    """Sell filled below bid → positive slippage (received less than market)."""
+    from tradingbot.live.loop import _sync_open_orders
+
+    db = connect(tmp_path / "tb.db")
+    _insert_order(db, "cid-sell-1", "SPY", "sell", 10.0, status="pending_new",
+                  quote_bid=100.00, quote_ask=100.05)
+    broker = FakeBroker(order_state={
+        "cid-sell-1": OrderResult(
+            client_order_id="cid-sell-1", broker_order_id="bro-sell-1",
+            status="filled", filled_qty=10.0, filled_avg_price=99.95,
+        ),
+    })
+    _sync_open_orders(db, broker)
+    row = db.execute(
+        "SELECT realized_slippage_bps FROM orders WHERE client_order_id='cid-sell-1'"
+    ).fetchone()
+    # sign = -1 for sell; (99.95 - 100.00) / 100.00 * 10000 * -1 = 5.0 bps positive
+    assert abs(row["realized_slippage_bps"] - 5.0) < 1e-6
+
+
+def test_sync_fill_handles_null_quote_gracefully(tmp_path):
+    """If no quote was captured, slippage stays NULL but the fill still records."""
+    from tradingbot.live.loop import _sync_open_orders
+
+    db = connect(tmp_path / "tb.db")
+    _insert_order(db, "cid-no-q", "SPY", "buy", 10.0, status="pending_new",
+                  quote_bid=None, quote_ask=None)
+    broker = FakeBroker(order_state={
+        "cid-no-q": OrderResult(
+            client_order_id="cid-no-q", broker_order_id="bro-no-q",
+            status="filled", filled_qty=10.0, filled_avg_price=100.0,
+        ),
+    })
+    _sync_open_orders(db, broker)
+    row = db.execute(
+        "SELECT status, realized_slippage_bps FROM orders WHERE client_order_id='cid-no-q'"
+    ).fetchone()
+    assert row["status"] == "filled"
+    assert row["realized_slippage_bps"] is None
+
+
+def test_sync_fill_detects_in_kind_fee_for_crypto_buy(tmp_path):
+    """Crypto buy: Alpaca says it filled 56.058 SOL but broker only shows 55.918.
+    The 0.14 gap is the in-kind fee."""
+    from tradingbot.live.loop import _sync_open_orders
+
+    db = connect(tmp_path / "tb.db")
+    _insert_order(db, "cid-sol", "SOL/USD", "buy", 56.058, status="pending_new",
+                  quote_bid=88.0, quote_ask=88.5)
+    broker = FakeBroker(order_state={
+        "cid-sol": OrderResult(
+            client_order_id="cid-sol", broker_order_id="bro-sol",
+            status="filled", filled_qty=56.058, filled_avg_price=88.33,
+        ),
+    })
+    _sync_open_orders(db, broker, broker_positions_canon={"SOLUSD": 55.918})
+    row = db.execute(
+        "SELECT fee_qty, realized_slippage_bps FROM orders WHERE client_order_id='cid-sol'"
+    ).fetchone()
+    assert abs(row["fee_qty"] - 0.14) < 1e-6
+    # buy: (88.33 - 88.5) / 88.5 * 10000 = negative (price improvement on this synthetic test)
+    assert row["realized_slippage_bps"] is not None
+
+
+def test_sync_fill_no_fee_on_equity(tmp_path):
+    from tradingbot.live.loop import _sync_open_orders
+
+    db = connect(tmp_path / "tb.db")
+    _insert_order(db, "cid-amzn", "AMZN", "buy", 18.0, status="pending_new",
+                  quote_bid=264.0, quote_ask=264.2)
+    broker = FakeBroker(order_state={
+        "cid-amzn": OrderResult(
+            client_order_id="cid-amzn", broker_order_id="bro-amzn",
+            status="filled", filled_qty=18.0, filled_avg_price=264.11,
+        ),
+    })
+    _sync_open_orders(db, broker, broker_positions_canon={"AMZN": 18.0})
+    row = db.execute(
+        "SELECT fee_qty FROM orders WHERE client_order_id='cid-amzn'"
+    ).fetchone()
+    assert row["fee_qty"] == 0.0
 
 
 # ---- _bot_positions ------------------------------------------------------

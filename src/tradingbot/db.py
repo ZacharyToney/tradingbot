@@ -88,6 +88,30 @@ CREATE INDEX IF NOT EXISTS idx_gate_log_ts ON gate_log(created_at_ms);
 """
 
 
+_ORDERS_NEW_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("quote_bid", "REAL"),
+    ("quote_ask", "REAL"),
+    ("quote_ts_ms", "INTEGER"),
+    ("intended_price", "REAL"),
+    ("filled_at_ms", "INTEGER"),
+    ("realized_slippage_bps", "REAL"),
+    ("fee_qty", "REAL"),
+)
+
+
+def _migrate_add_columns(conn: sqlite3.Connection) -> None:
+    """Idempotently add post-v1.0 columns to `orders`.
+
+    SQLite's ALTER TABLE ADD COLUMN is fast and safe (existing rows get NULL), but does
+    not support IF NOT EXISTS. We read PRAGMA table_info first and skip columns that
+    already exist so this runs cleanly on fresh AND existing databases.
+    """
+    existing = {r["name"] for r in conn.execute("PRAGMA table_info(orders)").fetchall()}
+    for name, col_type in _ORDERS_NEW_COLUMNS:
+        if name not in existing:
+            conn.execute(f"ALTER TABLE orders ADD COLUMN {name} {col_type}")
+
+
 def connect(db_path: Path | str) -> sqlite3.Connection:
     db_path = Path(db_path)
     db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -96,6 +120,7 @@ def connect(db_path: Path | str) -> sqlite3.Connection:
     conn.execute("PRAGMA journal_mode=WAL;")
     conn.execute("PRAGMA foreign_keys=ON;")
     conn.executescript(SCHEMA)
+    _migrate_add_columns(conn)
     return conn
 
 

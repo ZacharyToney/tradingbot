@@ -3,6 +3,14 @@ from __future__ import annotations
 from collections.abc import Iterable
 from dataclasses import dataclass
 
+from alpaca.data.historical import (
+    CryptoHistoricalDataClient,
+    StockHistoricalDataClient,
+)
+from alpaca.data.requests import (
+    CryptoLatestQuoteRequest,
+    StockLatestQuoteRequest,
+)
 from alpaca.trading.client import TradingClient
 from alpaca.trading.enums import OrderSide, OrderStatus, TimeInForce
 from alpaca.trading.requests import MarketOrderRequest
@@ -46,6 +54,15 @@ class OrderResult:
     filled_avg_price: float | None
 
 
+@dataclass(frozen=True)
+class Quote:
+    bid: float
+    ask: float
+    bid_size: float
+    ask_size: float
+    ts_ms: int
+
+
 class AlpacaBroker:
     """Thin wrapper. Always uses paper unless settings.trading_mode == 'live'."""
 
@@ -55,6 +72,13 @@ class AlpacaBroker:
             api_key=settings.alpaca_api_key,
             secret_key=settings.alpaca_secret,
             paper=settings.is_paper,
+        )
+        # Market-data clients reused for latest-quote snapshots on submit.
+        self._stock_data = StockHistoricalDataClient(
+            settings.alpaca_api_key, settings.alpaca_secret
+        )
+        self._crypto_data = CryptoHistoricalDataClient(
+            settings.alpaca_api_key, settings.alpaca_secret
         )
 
     @property
@@ -124,6 +148,30 @@ class AlpacaBroker:
         except Exception:
             return None
         return _to_result(o)
+
+    def get_latest_quote(self, symbol: str) -> Quote | None:
+        """Best-effort latest top-of-book quote. Returns None on any failure so callers
+        never block trading on a measurement-only data path."""
+        try:
+            if "/" in symbol:
+                req = CryptoLatestQuoteRequest(symbol_or_symbols=symbol)
+                resp = self._crypto_data.get_crypto_latest_quote(req)
+            else:
+                req = StockLatestQuoteRequest(symbol_or_symbols=symbol)
+                resp = self._stock_data.get_stock_latest_quote(req)
+            q = resp.get(symbol)
+            if q is None:
+                return None
+            return Quote(
+                bid=float(q.bid_price),
+                ask=float(q.ask_price),
+                bid_size=float(q.bid_size or 0),
+                ask_size=float(q.ask_size or 0),
+                ts_ms=int(q.timestamp.timestamp() * 1000),
+            )
+        except Exception as e:
+            logger.warning(f"get_latest_quote failed symbol={symbol}: {e}")
+            return None
 
 
 def _is_duplicate_cid_error(e: Exception) -> bool:
