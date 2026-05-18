@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Iterable
 from dataclasses import dataclass
 
+from alpaca.data.enums import DataFeed
 from alpaca.data.historical import (
     CryptoHistoricalDataClient,
     StockHistoricalDataClient,
@@ -157,7 +158,10 @@ class AlpacaBroker:
                 req = CryptoLatestQuoteRequest(symbol_or_symbols=symbol)
                 resp = self._crypto_data.get_crypto_latest_quote(req)
             else:
-                req = StockLatestQuoteRequest(symbol_or_symbols=symbol)
+                req = StockLatestQuoteRequest(
+                    symbol_or_symbols=symbol,
+                    feed=DataFeed(self._settings.equity_data_feed),
+                )
                 resp = self._stock_data.get_stock_latest_quote(req)
             q = resp.get(symbol)
             if q is None:
