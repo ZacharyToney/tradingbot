@@ -68,6 +68,30 @@ def test_cost_report_aggregates_median_and_p90_per_strategy(tmp_path: Path, caps
     assert "overall median" in out
 
 
+def test_cost_report_p90_uses_proper_percentile_for_small_n(tmp_path: Path, capsys):
+    """Regression for the 2026-05-20 cost-report bug: with n=3 the hand-rolled index
+    `int(0.9 * n) - 1` returned the wrong value (-32.2 for the IWM/AMZN/GOOGL case
+    when p90 should be near the +87.9 GOOGL outlier). statistics.quantiles fixes it."""
+    db_path = tmp_path / "tb.db"
+    db = connect(db_path)
+    # Same three values that surfaced the bug in production.
+    _insert_filled_order(db, "a", "rsi2", "IWM", "buy", 18.0, -32.2)
+    _insert_filled_order(db, "b", "rsi2", "AMZN", "sell", 18.0, -43.4)
+    _insert_filled_order(db, "c", "rsi2", "GOOGL", "buy", 12.0, 87.9)
+    db.close()
+
+    _cmd_cost_report(_S(db_path), _Args())
+    out = capsys.readouterr().out
+    # statistics.quantiles for [−43.4, −32.2, 87.9] at 90th pct (inclusive method) ≈ 63.9.
+    # Old buggy code returned -32.2. We accept anything >= ~50 as "obviously not the old bug."
+    lines = [ln for ln in out.splitlines() if "rsi2" in ln and "equity" in ln]
+    assert lines, f"no rsi2/equity line in output: {out}"
+    # Columns are right-aligned: ... median_bps  p90_bps  fee_$
+    parts = lines[0].split()
+    p90 = float(parts[-2])
+    assert p90 > 50, f"p90 looks like the old bug: {p90} (full line: {lines[0]})"
+
+
 def test_cost_report_filters_by_strategy(tmp_path: Path, capsys):
     db_path = tmp_path / "tb.db"
     db = connect(db_path)

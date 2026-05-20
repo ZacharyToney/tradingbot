@@ -263,6 +263,71 @@ def test_dry_run_also_captures_quote(tmp_path):
     assert row["quote_ask"] == 100.5
 
 
+def test_opposite_side_in_flight_blocks_submit(tmp_path):
+    """Regression for the 2026-05-20 wash-trade error: if a BUY is partially filled
+    and still open at the broker, the runner must refuse to submit a SELL on the
+    same symbol — Alpaca rejects it as a wash trade, and the cleaner thing is to
+    short-circuit at our layer with a clear audit-log row."""
+    settings = _settings()
+    broker = FakeBroker()
+    db = _conn(tmp_path)
+    # Pre-existing buy still open at broker.
+    db.execute(
+        """INSERT INTO orders
+           (client_order_id, broker_order_id, strategy, symbol, side, qty,
+            order_type, limit_price, status, submitted_at_ms, updated_at_ms, reject_reason)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        ("cid-buy-open", "bro-x", "rsi2", "GOOGL", "buy", 12.0,
+         "market", None, "partially_filled", 0, 0, None),
+    )
+    runner = OrderRunner(settings=settings, broker=broker, db=db, dry_run=False)
+
+    sell_order = IntendedOrder(
+        strategy="rsi2", symbol="GOOGL", side="sell", qty=10.0, price=388.0,
+        asset_class="equity", bar_ts_ms=1_700_000_000_000,
+        client_order_id="cid-sell-attempt",
+    )
+    # State has a real long position in GOOGL (broker truth), so the long-only-equities
+    # gate passes — that's what made the prod bug land at the broker instead of being
+    # caught by the gates.
+    state = _state(tmp_path, current_qty_for_symbol=10.0)
+    decision = runner.process_one(sell_order, state)
+    assert not decision.allow
+    assert "opposite side in flight" in decision.reason
+    assert broker.calls == []  # no submit to Alpaca
+    row = db.execute(
+        "SELECT status, reject_reason FROM orders WHERE client_order_id='cid-sell-attempt'"
+    ).fetchone()
+    assert row["status"] == "rejected"
+    assert "opposite side in flight" in row["reject_reason"]
+
+
+def test_same_side_in_flight_does_not_block(tmp_path):
+    """Same-side duplicates are handled by the cid-uniqueness check, not this guard."""
+    settings = _settings()
+    broker = FakeBroker()
+    db = _conn(tmp_path)
+    db.execute(
+        """INSERT INTO orders
+           (client_order_id, broker_order_id, strategy, symbol, side, qty,
+            order_type, limit_price, status, submitted_at_ms, updated_at_ms, reject_reason)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        ("cid-buy-1", "bro-y", "rsi2", "SPY", "buy", 10.0,
+         "market", None, "new", 0, 0, None),
+    )
+    runner = OrderRunner(settings=settings, broker=broker, db=db, dry_run=False)
+
+    # A NEW buy for SPY (different cid) — this isn't the opposite-side case.
+    new_buy = IntendedOrder(
+        strategy="rsi2", symbol="SPY", side="buy", qty=5.0, price=100.0,
+        asset_class="equity", bar_ts_ms=1_700_000_000_000,
+        client_order_id="cid-buy-2",
+    )
+    decision = runner.process_one(new_buy, _state(tmp_path))
+    assert decision.allow
+    assert len(broker.calls) == 1
+
+
 def test_buy_not_affected_by_broker_positions(tmp_path):
     """The sell-side clamp must not touch buy orders. Buys can size up freely; only
     sells need protection from drift between recorded and actual balances."""

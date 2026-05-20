@@ -209,16 +209,19 @@ def test_tick_halt_file_blocks_orders(tmp_path: Path):
 
 # ---- _sync_open_orders ----------------------------------------------------
 
-def _insert_order(db, cid, symbol, side, qty, status, quote_bid=None, quote_ask=None):
+def _insert_order(
+    db, cid, symbol, side, qty, status, quote_bid=None, quote_ask=None,
+    strategy="donchian", filled_qty=None,
+):
     """Helper: stuff a row into orders for the sync tests."""
     db.execute(
         """INSERT INTO orders
            (client_order_id, broker_order_id, strategy, symbol, side, qty,
             order_type, limit_price, status, submitted_at_ms, updated_at_ms, reject_reason,
-            quote_bid, quote_ask)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        (cid, "bro-1", "donchian", symbol, side, qty,
-         "market", None, status, 0, 0, None, quote_bid, quote_ask),
+            quote_bid, quote_ask, filled_qty)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (cid, "bro-1", strategy, symbol, side, qty,
+         "market", None, status, 0, 0, None, quote_bid, quote_ask, filled_qty),
     )
 
 
@@ -442,6 +445,86 @@ def test_bot_positions_layers_in_flight_orders_on_top_of_broker_truth(tmp_path):
     )
     # 0 broker + 18 in-flight = 18 effective.
     assert bot_positions == {"AMZN": 18.0}
+
+
+def test_bot_positions_partial_fill_does_not_double_count(tmp_path):
+    """Regression for the wash-trade bug observed 2026-05-20: GOOGL buy 12 partially
+    filled to 10 → broker shows 10 → if we still add the full submitted qty (12) to
+    in-flight, effective = 22, blowing past the target and triggering a wrong-side
+    sell. The fix: add only the REMAINING unfilled portion (qty - filled_qty)."""
+    from tradingbot.live.loop import _bot_positions
+
+    db = connect(tmp_path / "tb.db")
+    _insert_order(
+        db, "cid-googl-1", "GOOGL", "buy", 12.0,
+        status="partially_filled", filled_qty=10.0, strategy="rsi2",
+    )
+    bot_positions = _bot_positions(
+        db,
+        strategy_name="rsi2",
+        symbols=["GOOGL"],
+        broker_positions_canon={"GOOGL": 10.0},
+    )
+    # 10 broker + 2 remaining unfilled = 12 effective. NOT 22.
+    assert bot_positions == {"GOOGL": 12.0}
+
+
+def test_bot_positions_fully_unfilled_order_uses_full_qty(tmp_path):
+    """Sanity check that a status=new order (no fills yet) still adds full qty."""
+    from tradingbot.live.loop import _bot_positions
+
+    db = connect(tmp_path / "tb.db")
+    _insert_order(
+        db, "cid-sym-1", "MSFT", "buy", 15.0,
+        status="new", filled_qty=0.0, strategy="rsi2",
+    )
+    bot_positions = _bot_positions(
+        db, strategy_name="rsi2", symbols=["MSFT"], broker_positions_canon={},
+    )
+    assert bot_positions == {"MSFT": 15.0}
+
+
+def test_sync_open_orders_updates_filled_qty_on_partial(tmp_path):
+    """After Phase 8: every status sync writes the latest filled_qty so _bot_positions
+    can compute remaining-unfilled. UPSERT also updates the fills row qty."""
+    from tradingbot.live.loop import _sync_open_orders
+
+    db = connect(tmp_path / "tb.db")
+    _insert_order(db, "cid-part", "GOOGL", "buy", 12.0, status="new",
+                  quote_bid=388.50, quote_ask=388.76)
+    broker = FakeBroker(order_state={
+        "cid-part": OrderResult(
+            client_order_id="cid-part", broker_order_id="bro-part",
+            status="partially_filled", filled_qty=10.0, filled_avg_price=390.0,
+        ),
+    })
+    _sync_open_orders(db, broker)
+    row = db.execute(
+        "SELECT status, filled_qty FROM orders WHERE client_order_id='cid-part'"
+    ).fetchone()
+    assert row["status"] == "partially_filled"
+    assert row["filled_qty"] == 10.0
+    fill = db.execute(
+        "SELECT qty FROM fills WHERE client_order_id='cid-part'"
+    ).fetchone()
+    assert fill["qty"] == 10.0
+
+    # Now simulate the partial -> full transition. UPSERT should update qty 10 -> 12.
+    broker.order_state["cid-part"] = OrderResult(
+        client_order_id="cid-part", broker_order_id="bro-part",
+        status="filled", filled_qty=12.0, filled_avg_price=391.0,
+    )
+    _sync_open_orders(db, broker)
+    row = db.execute(
+        "SELECT status, filled_qty FROM orders WHERE client_order_id='cid-part'"
+    ).fetchone()
+    assert row["status"] == "filled"
+    assert row["filled_qty"] == 12.0
+    fill = db.execute(
+        "SELECT qty, price FROM fills WHERE client_order_id='cid-part'"
+    ).fetchone()
+    assert fill["qty"] == 12.0       # UPSERT updated, not silently ignored
+    assert fill["price"] == 391.0    # ...and the price too
 
 
 def test_bot_positions_symbol_canonicalization_for_crypto(tmp_path):

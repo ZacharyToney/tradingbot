@@ -96,6 +96,9 @@ _ORDERS_NEW_COLUMNS: tuple[tuple[str, str], ...] = (
     ("filled_at_ms", "INTEGER"),
     ("realized_slippage_bps", "REAL"),
     ("fee_qty", "REAL"),
+    # Phase 8: track broker-reported filled_qty so partial fills don't over-count in
+    # _bot_positions in-flight math.
+    ("filled_qty", "REAL"),
 )
 
 

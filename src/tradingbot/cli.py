@@ -364,7 +364,7 @@ def _cmd_cost_report(settings, args) -> int:
     Output: per-(strategy, asset_class) median + p90 slippage (bps), total fee in $,
     plus a one-line gap-vs-5bps-assumption summary.
     """
-    from statistics import median
+    from statistics import median, quantiles
 
     from tradingbot.db import connect
 
@@ -417,7 +417,8 @@ def _cmd_cost_report(settings, args) -> int:
     for (strat, asset), g in sorted(groups.items()):
         slips = g["slip"]
         med = median(slips)
-        p90 = sorted(slips)[max(0, int(0.9 * len(slips)) - 1)] if len(slips) > 1 else slips[0]
+        # statistics.quantiles needs n >= 2. For n=1, p90 collapses to the only value.
+        p90 = quantiles(slips, n=10, method="inclusive")[8] if len(slips) >= 2 else slips[0]
         print(
             f"{strat:<12}{asset:<8}{g['n']:>5}{med:>14.1f}{p90:>12.1f}{g['fee_usd']:>12.2f}"
         )

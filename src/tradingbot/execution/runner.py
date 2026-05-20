@@ -18,6 +18,10 @@ from tradingbot.execution.broker import OrderResult, Quote
 from tradingbot.risk.gates import AccountState, IntendedOrder, pre_trade
 from tradingbot.risk.limits import Decision
 
+# Mirror of live.loop._OPEN_ORDER_STATUSES. Duplicated to avoid an import cycle
+# (loop imports runner). Both must stay in sync.
+_OPEN_ORDER_STATUSES_FOR_RUNNER = ("new", "accepted", "pending_new", "partially_filled")
+
 
 class _BrokerLike(Protocol):
     def submit_market_order(
@@ -71,6 +75,35 @@ class OrderRunner:
                 f"duplicate cid={order.client_order_id} status={existing['status']}, skipped"
             )
             return decision
+
+        # Opposite-side-in-flight check: refuse to submit a sell when a buy on the
+        # same symbol is still open at the broker (and vice versa). Alpaca rejects
+        # these as wash trades anyway; we catch it earlier so the failure is one
+        # clean rejected row in the audit log instead of a broker HTTPError stack
+        # trace. Seen in production on 2026-05-20 when GOOGL partial-fill math
+        # over-counted in-flight qty and emitted a wrong-side order.
+        opposite_side = "sell" if order.side == "buy" else "buy"
+        open_opposite = self.db.execute(
+            f"""SELECT client_order_id FROM orders
+                WHERE symbol = ? AND side = ?
+                  AND status IN ({",".join("?" * len(_OPEN_ORDER_STATUSES_FOR_RUNNER))})
+                LIMIT 1""",
+            (order.symbol, opposite_side, *_OPEN_ORDER_STATUSES_FOR_RUNNER),
+        ).fetchone()
+        if open_opposite is not None:
+            logger.warning(
+                f"skip {order.side}: opposite-side order in flight for {order.symbol} "
+                f"(blocking cid={open_opposite['client_order_id']}, "
+                f"new cid={order.client_order_id})"
+            )
+            self._persist_order(
+                order,
+                status="rejected",
+                broker_order_id=None,
+                reject_reason="opposite side in flight",
+                quote=None,
+            )
+            return Decision(False, "opposite side in flight")
 
         # Sell-side clamp: never ask the broker to sell more than it actually holds.
         # Protects against drift between recorded fills and real balance (in-kind fees,

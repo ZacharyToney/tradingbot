@@ -256,8 +256,12 @@ def _sync_open_orders(
             else:
                 fee_qty = 0.0
 
+        # Always write the latest filled_qty so _bot_positions can compute
+        # remaining-unfilled correctly for partial fills.
+        broker_filled_qty = float(result.filled_qty) if result.filled_qty else 0.0
         db.execute(
             """UPDATE orders SET status = ?, broker_order_id = ?, updated_at_ms = ?,
+                 filled_qty = ?,
                  realized_slippage_bps = COALESCE(?, realized_slippage_bps),
                  fee_qty = COALESCE(?, fee_qty),
                  filled_at_ms = COALESCE(?, filled_at_ms)
@@ -266,17 +270,24 @@ def _sync_open_orders(
                 result.status,
                 result.broker_order_id,
                 utc_now_ms(),
+                broker_filled_qty,
                 realized_slippage_bps,
                 fee_qty,
                 filled_at_ms,
                 cid,
             ),
         )
+        # UPSERT the fill row so partial -> full transitions update qty/price/filled_at_ms
+        # instead of being silently ignored. fill_id PK ensures one row per broker order.
         if result.filled_qty and result.filled_qty > 0 and result.filled_avg_price:
             db.execute(
-                """INSERT OR IGNORE INTO fills
+                """INSERT INTO fills
                    (fill_id, client_order_id, symbol, side, qty, price, filled_at_ms)
-                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                   VALUES (?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(fill_id) DO UPDATE SET
+                     qty = excluded.qty,
+                     price = excluded.price,
+                     filled_at_ms = excluded.filled_at_ms""",
                 (
                     f"{result.broker_order_id}-1",
                     cid,
@@ -326,17 +337,22 @@ def _bot_positions(
     positions: dict[str, float] = {
         symbol: broker_positions_canon.get(canon_symbol(symbol), 0.0) for symbol in symbols
     }
-    # In-flight orders (placed at broker, not yet filled/cancelled/rejected).
+    # In-flight orders (placed at broker, not yet filled/cancelled/rejected). Add only
+    # the REMAINING unfilled portion (qty - filled_qty): broker_positions_canon already
+    # reflects the filled portion of partial fills. Without this subtraction we'd
+    # double-count the filled chunk and emit a spurious opposite-side order on the
+    # next tick (the wash-trade-detected bug seen in production on 2026-05-20).
     placeholders = ",".join("?" * len(_OPEN_ORDER_STATUSES))
     rows = db.execute(
-        f"""SELECT symbol, side, qty
+        f"""SELECT symbol, side, qty, COALESCE(filled_qty, 0.0) AS filled_qty
             FROM orders
             WHERE strategy = ? AND status IN ({placeholders})""",
         (strategy_name, *_OPEN_ORDER_STATUSES),
     ).fetchall()
     for r in rows:
         sign = 1.0 if r["side"] == "buy" else -1.0
-        positions[r["symbol"]] = positions.get(r["symbol"], 0.0) + sign * float(r["qty"])
+        remaining = max(0.0, float(r["qty"]) - float(r["filled_qty"]))
+        positions[r["symbol"]] = positions.get(r["symbol"], 0.0) + sign * remaining
     return positions
 
 
