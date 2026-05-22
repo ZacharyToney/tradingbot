@@ -55,5 +55,21 @@ class Settings(BaseSettings):
         return p if p.is_absolute() else REPO_ROOT / p
 
 
-def load_settings() -> Settings:
+def load_settings(env_file: str | Path | None = None) -> Settings:
+    """Load Settings, optionally from a specific .env-style file.
+
+    Defaults to the repo's `.env` (matches Settings.model_config). The override lets
+    Track B's chaos sandbox load from `.env.chaos` so it talks to a different Alpaca
+    paper account and writes to a different SQLite DB. Falls back to the
+    `TRADINGBOT_ENV_FILE` env var if no explicit path is given — that's what the
+    systemd unit uses.
+    """
+    import os
+
+    chosen = env_file or os.environ.get("TRADINGBOT_ENV_FILE")
+    if chosen:
+        chosen_path = Path(chosen)
+        if not chosen_path.is_absolute():
+            chosen_path = REPO_ROOT / chosen_path
+        return Settings(_env_file=str(chosen_path))  # type: ignore[call-arg]
     return Settings()  # type: ignore[call-arg]

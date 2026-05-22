@@ -1,0 +1,21 @@
+[Unit]
+Description=tradingBot CHAOS (Track B) paper-trading loop — separate Alpaca account
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/code/tradingBot
+# Point at a different Alpaca paper account (different API key/secret) and a
+# different SQLite DB so this service cannot contaminate Track A's audit log.
+# Create .env.chaos manually from .env.chaos.example.
+Environment=TRADINGBOT_ENV_FILE=%h/code/tradingBot/.env.chaos
+ExecStart=%h/.local/bin/tb live --paper --strategies chaos --execute
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=tradingbot-chaos
+
+[Install]
+WantedBy=default.target

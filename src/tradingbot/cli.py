@@ -15,15 +15,25 @@ STRATEGY_REGISTRY = {}
 
 def _register_strategies() -> None:
     """Lazy registration to keep CLI startup fast and avoid import-time side effects."""
+    from tradingbot.strategies.chaos_crypto import ChaosCryptoMomentum
     from tradingbot.strategies.donchian_breakout import DonchianBreakout
     from tradingbot.strategies.rsi2_mean_reversion import RSI2MeanReversion
 
     STRATEGY_REGISTRY["rsi2"] = RSI2MeanReversion
     STRATEGY_REGISTRY["donchian"] = DonchianBreakout
+    STRATEGY_REGISTRY["chaos"] = ChaosCryptoMomentum
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="tb", description="tradingBot CLI")
+    parser.add_argument(
+        "--env-file",
+        default=None,
+        help=(
+            "Path to an alternate .env file (e.g. .env.chaos for Track B). "
+            "Overrides the default .env. Also honored via TRADINGBOT_ENV_FILE env var."
+        ),
+    )
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     sub.add_parser("status", help="Print account snapshot + open positions")
@@ -39,7 +49,7 @@ def main(argv: list[str] | None = None) -> int:
     cr.add_argument("--strategy", default=None, help="Filter to one strategy (rsi2|donchian)")
 
     bt = sub.add_parser("backtest", help="Run a backtest")
-    bt.add_argument("strategy", choices=["rsi2", "donchian"], help="Strategy name")
+    bt.add_argument("strategy", choices=["rsi2", "donchian", "chaos"], help="Strategy name")
     bt.add_argument("--from", dest="start", required=True, help="YYYY-MM-DD inclusive")
     bt.add_argument("--to", dest="end", required=True, help="YYYY-MM-DD inclusive")
     bt.add_argument("--symbols", required=True, help="Comma-separated, e.g. SPY,QQQ")
@@ -47,7 +57,7 @@ def main(argv: list[str] | None = None) -> int:
     bt.add_argument("--slippage-bps", type=float, default=5.0)
 
     wf = sub.add_parser("walkforward", help="Walk-forward parameter optimization")
-    wf.add_argument("strategy", choices=["rsi2", "donchian"])
+    wf.add_argument("strategy", choices=["rsi2", "donchian", "chaos"])
     wf.add_argument("--from", dest="start", required=True)
     wf.add_argument("--to", dest="end", required=True)
     wf.add_argument("--symbols", required=True)
@@ -82,7 +92,7 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     args = parser.parse_args(argv)
-    settings = load_settings()
+    settings = load_settings(env_file=args.env_file)
     configure_logging(settings)
 
     if args.cmd == "status":

@@ -11,6 +11,8 @@ wheels/
 
 # Secrets and runtime artifacts
 .env
+.env.chaos
+.env.local
 *.db
 *.db-journal
 *.db-shm
