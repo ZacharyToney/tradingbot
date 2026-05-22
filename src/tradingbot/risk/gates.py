@@ -56,6 +56,12 @@ class AccountState:
     daytrades_in_5d: int
     now: datetime
     repo_root: Path
+    # The "no-compounding" sizing baseline (captured at first startup, persisted).
+    # MUST match the equity number used by `size_position` so the gate's cap check
+    # uses the same denominator. Otherwise tiny equity drift (P&L, slippage) makes
+    # the computed notional ratio drift past the FP-tolerance on the cap gate and
+    # silently rejects orders that are mathematically at-cap.
+    equity_for_sizing: float = 0.0
 
 
 def pre_trade(order: IntendedOrder, state: AccountState, settings: Settings) -> Decision:
@@ -109,8 +115,12 @@ def pre_trade(order: IntendedOrder, state: AccountState, settings: Settings) -> 
     # 3. Size / concurrency. These only apply when opening (or growing) a position.
     is_opening = _is_opening_or_growing(order, state.current_qty_for_symbol)
     if is_opening:
+        # Use equity_for_sizing (not equity_now) so the cap check matches the
+        # denominator used by `size_position`. Falls back to equity_now if not set
+        # (for older callers / tests that pre-date the field).
+        sizing_eq = state.equity_for_sizing or state.equity_now
         checks.append(
-            check_max_position_pct(order.notional, state.equity_now, settings.max_position_pct)
+            check_max_position_pct(order.notional, sizing_eq, settings.max_position_pct)
         )
         if not checks[-1].allow:
             return checks[-1]

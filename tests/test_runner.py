@@ -44,6 +44,7 @@ def _state(repo_root: Path, **overrides) -> AccountState:
         daytrades_in_5d=0,
         now=datetime(2025, 5, 13, 15, 0, tzinfo=UTC),
         repo_root=repo_root,
+        equity_for_sizing=100_000.0,
     )
     base.update(overrides)
     return AccountState(**base)

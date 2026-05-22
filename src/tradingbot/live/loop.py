@@ -503,6 +503,7 @@ def tick(ctx: LiveContext) -> None:
                 daytrades_in_5d=ctx.broker.get_account().daytrade_count,
                 now=now,
                 repo_root=ctx.repo_root,
+                equity_for_sizing=starting_equity,
             )
             runner.process_one(order, state, broker_positions_canon)
 

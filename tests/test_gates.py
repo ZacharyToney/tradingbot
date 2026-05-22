@@ -53,6 +53,7 @@ def _state(**overrides) -> AccountState:
         daytrades_in_5d=0,
         now=datetime(2025, 5, 13, 15, 0, tzinfo=UTC),  # Tue 11:00 ET — RTH
         repo_root=Path("/tmp/_tradingbot_test_no_halt"),
+        equity_for_sizing=100_000.0,
     )
     base.update(overrides)
     return AccountState(**base)
@@ -120,6 +121,35 @@ def test_pre_trade_equity_drift_blocks(tmp_path: Path):
     s = _state(repo_root=tmp_path, broker_equity=102_500.0)  # +2.5% drift
     d = pre_trade(_order(), s, _settings())
     assert not d.allow and "drift" in d.reason.lower()
+
+
+def test_max_position_pct_uses_equity_for_sizing_not_current_equity(tmp_path: Path):
+    """Regression for the 2026-05-22 chaos-bot rounding cascade.
+
+    Sizing uses starting_equity (no compounding); the gate's cap check must use the
+    SAME denominator. If it uses equity_now instead, a small unrealized loss makes a
+    correctly-sized at-cap order look slightly over-cap and the gate falsely rejects it.
+    Reproduces the live failure: $1000 starting, $999.83 current after a small drawdown,
+    order sized at exactly $250 (25% of starting) gets rejected because $250 / $999.83
+    = 25.004% > 25% cap.
+    """
+    # Order sized to be at-cap relative to starting equity.
+    order = _order(side="buy", qty=2.5)   # qty * price=100 = $250 notional
+    # equity_for_sizing stays at the starting baseline; equity_now has drifted down.
+    s = _state(
+        repo_root=tmp_path,
+        equity_now=999.83,
+        equity_for_sizing=1000.0,
+        equity_start_of_day=1000.0,
+        equity_all_time_high=1000.0,
+        last_recon_equity=999.83,
+        broker_equity=999.83,
+    )
+    settings = _settings(max_position_pct=0.25)
+    d = pre_trade(order, s, settings)
+    # With the fix, gate uses equity_for_sizing=1000 → 250/1000 = 25.0% = at cap → pass.
+    # Pre-fix, it would have used equity_now=999.83 → 250/999.83 = 25.004% > cap → reject.
+    assert d.allow, f"gate falsely rejected at-cap order: {d.reason}"
 
 
 def test_pre_trade_extended_hours_blocks_equity(tmp_path: Path):
