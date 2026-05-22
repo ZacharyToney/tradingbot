@@ -5,6 +5,10 @@ Run:
 
 Reads from the bot's SQLite audit log AND the live broker for ground-truth positions.
 Manual refresh by default (top-right button) — Streamlit reruns on every interaction.
+
+Sidebar selector switches between Track A (paper, .env) and Track B (chaos, .env.chaos)
+so the same dashboard serves both accounts. Cached resources are keyed on env_file
+path so broker/DB clients don't bleed between accounts.
 """
 from __future__ import annotations
 
@@ -21,18 +25,27 @@ from tradingbot.execution.broker import AlpacaBroker
 st.set_page_config(page_title="tradingBot", page_icon="📈", layout="wide")
 
 
-@st.cache_resource
-def _settings():
-    return load_settings()
+# Account choices: label -> env_file path (None = default .env, i.e. Track A).
+_ACCOUNTS = {
+    "Track A (paper)": None,
+    "Track B (chaos)": ".env.chaos",
+}
 
 
 @st.cache_resource
-def _broker(_settings_obj):
+def _settings(env_file: str | None):
+    return load_settings(env_file=env_file)
+
+
+@st.cache_resource
+def _broker(_settings_obj, _cache_key: str):
+    # _cache_key is just to scope the cache per account; the underlying broker is
+    # built from the settings object.
     return AlpacaBroker(_settings_obj)
 
 
-def _db() -> sqlite3.Connection:
-    settings = _settings()
+def _db(env_file: str | None) -> sqlite3.Connection:
+    settings = _settings(env_file)
     return connect(settings.db_full_path)
 
 
@@ -46,10 +59,32 @@ def _ms_to_dt(ms: int) -> datetime:
 
 
 def main() -> None:
-    settings = _settings()
+    # Sidebar account selector — default Track A preserves existing behavior.
+    account_label = st.sidebar.selectbox(
+        "Account", list(_ACCOUNTS.keys()), index=0, key="account_selector"
+    )
+    env_file = _ACCOUNTS[account_label]
+
+    # Guard: if Track B is selected but .env.chaos doesn't exist yet, render a
+    # helpful message instead of crashing on missing-keys ValidationError.
+    if env_file is not None and not (REPO_ROOT / env_file).exists():
+        st.title(f"tradingBot — {account_label}")
+        st.warning(
+            f"`{env_file}` not found at the repo root. Bring Track B up first — see "
+            "README → 'Two tracks' → 'Bring up Track B'."
+        )
+        return
+
+    try:
+        settings = _settings(env_file)
+    except Exception as e:
+        st.title(f"tradingBot — {account_label}")
+        st.error(f"failed to load settings from `{env_file or '.env'}`: {e}")
+        return
+
     halt_present = (REPO_ROOT / "HALT").exists()
 
-    st.title("tradingBot")
+    st.title(f"tradingBot — {account_label}")
     col1, col2, col3 = st.columns([1, 1, 2])
     col1.metric("Mode", settings.trading_mode.upper())
     col2.metric("HALT", "⚠️ ACTIVE" if halt_present else "✓ clear")
@@ -73,9 +108,10 @@ def main() -> None:
     st.divider()
 
     # --- Account snapshot ---
+    cache_key = env_file or "_default"
     st.subheader("Account")
     try:
-        acc = _broker(settings).get_account()
+        acc = _broker(settings, cache_key).get_account()
         a1, a2, a3, a4 = st.columns(4)
         a1.metric("Equity", f"${acc.equity:,.2f}")
         a2.metric("Cash", f"${acc.cash:,.2f}")
@@ -86,7 +122,7 @@ def main() -> None:
 
     # --- Equity curve ---
     st.subheader("Equity curve (last 30 days)")
-    conn = _db()
+    conn = _db(env_file)
     since_ms = int((datetime.now(UTC) - timedelta(days=30)).timestamp() * 1000)
     eq = _query_df(
         conn,
@@ -104,7 +140,7 @@ def main() -> None:
     with pos_cols[0]:
         st.subheader("Broker positions")
         try:
-            positions = _broker(settings).get_positions()
+            positions = _broker(settings, cache_key).get_positions()
             if positions:
                 st.dataframe(
                     pd.DataFrame(

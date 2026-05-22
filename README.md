@@ -64,7 +64,8 @@ uv run streamlit run dashboard/app.py
 
 Opens at http://localhost:8501 — shows account snapshot, equity curve, positions
 (broker truth + bot-tracked audit log), today's signals, recent fills, gate decisions,
-and a HALT button.
+and a HALT button. The sidebar has a selector to flip between Track A and Track B
+(chaos) so the same dashboard serves both accounts.
 
 ### Backtest
 
@@ -100,12 +101,71 @@ uv run tb reconcile   # drift report between bot-tracked positions and broker
 uv run tb halt        # create the HALT file
 ```
 
+## Two tracks
+
+The bot runs in two isolated configurations against **separate Alpaca paper accounts**:
+
+| | Track A (paper) | Track B (chaos) |
+| --- | --- | --- |
+| Strategies | `rsi2`, `donchian` | `chaos` (1h crypto breakout) |
+| Goal | Evidence-gathering for eventual live capital | Aggressive sandbox, no edge claim |
+| Position sizing | 5% / position | 25% / position |
+| Concurrency cap | 3 | 2 |
+| Daily-loss halt | -2% | -5% |
+| Total-DD halt | -10% | -25% |
+| Service | `tradingbot.service` | `tradingbot-chaos.service` |
+| Env file | `.env` | `.env.chaos` |
+| Audit log | `tradingbot.db` | `tradingbot-chaos.db` |
+
+**Why isolated:** Track A is the disciplined paper run that has to produce trustworthy
+evidence before any live consideration. Track B is the experimental track for
+higher-risk strategies. If Track B blew up the schema or burned a position into shared
+state, Track A's evidence would be useless.
+
+### Bring up Track B
+
+```sh
+# 1. Create a SECOND Alpaca paper account at https://app.alpaca.markets
+#    (Alpaca lets you have multiple paper accounts under one login.)
+#    Generate fresh API key/secret on that account.
+
+# 2. Make the env file
+cp .env.chaos.example .env.chaos
+chmod 600 .env.chaos
+# Edit .env.chaos and paste the NEW chaos paper account keys.
+
+# 3. Install + start the chaos systemd unit
+cp deploy/tradingbot-chaos.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now tradingbot-chaos.service
+
+# 4. Watch
+journalctl --user -u tradingbot-chaos -f
+```
+
+### Query either track from the CLI
+
+```sh
+# Default targets .env (Track A)
+tb status
+tb reconcile
+tb cost-report
+
+# --env-file override targets Track B
+tb --env-file .env.chaos status
+tb --env-file .env.chaos cost-report
+```
+
+The same flag works on every subcommand. The Streamlit dashboard has a sidebar
+selector for switching between tracks.
+
 ## Strategies (v1)
 
-| Strategy | Asset class | Entry | Exit |
-| --- | --- | --- | --- |
-| `rsi2` mean reversion | Equity ETFs / megacaps | RSI(2) < 10 AND close > SMA(200) | RSI(2) > 70 OR 5 bars elapsed |
-| `donchian` breakout | Crypto (BTC/ETH/SOL) | Close > 20-day high (long) | Close < 10-day low (exit) |
+| Strategy | Track | Asset class | Timeframe | Entry | Exit |
+| --- | --- | --- | --- | --- | --- |
+| `rsi2` mean reversion | A | Equity ETFs / megacaps | 1d | RSI(2) < 10 AND close > SMA(200) | RSI(2) > 70 OR 5 bars elapsed |
+| `donchian` breakout | A | Crypto (BTC/ETH/SOL) | 1d | Close > 20-day high (long) | Close < 10-day low (exit) |
+| `chaos` momentum | B | Crypto (BTC/ETH/SOL) | 1h | Close > 12h high | Close < 6h low OR 24h elapsed |
 
 ## Risk caps (hardcoded in `risk/limits.py`)
 
