@@ -15,9 +15,14 @@ from tradingbot.risk.sizing import size_position
 # changing it invalidates idempotency across all historical orders.
 _CID_NAMESPACE = uuid.UUID("a4f0d2b1-77c8-4f0e-9a4f-8b1d2e3f4a5b")
 
-# Don't emit an order for diffs smaller than 1 share (equities) — matches the whole-share
-# rounding in `size_position`. Crypto dust is filtered upstream in `size_position`.
-_DUST_QTY_EPS = 1.0
+# Dust thresholds — don't bother submitting trivially small rebalances.
+# Equity: 1.0 share (matches the whole-share rounding in `size_position`).
+# Crypto: $5 notional. Comfortably above Alpaca's minimum-order floor (~$1) and below
+#         what could plausibly matter at any sane equity. Without this asset-class
+#         split, small accounts silently drop fractional crypto orders below 1.0 base
+#         asset (e.g. 0.089 ETH at $2.8k = $250 was being dropped as "dust").
+_DUST_QTY_EPS_EQUITY = 1.0
+_DUST_USD_EPS_CRYPTO = 5.0
 
 
 def _build_client_order_id(strategy: str, symbol: str, bar_ts_ms: int, side: str) -> str:
@@ -55,7 +60,12 @@ def reconcile(
         )
 
         delta = target_qty - current_qty
-        if abs(delta) < _DUST_QTY_EPS:
+        dust_threshold = (
+            _DUST_QTY_EPS_EQUITY
+            if asset_class == "equity"
+            else _DUST_USD_EPS_CRYPTO / price
+        )
+        if abs(delta) < dust_threshold:
             continue
 
         side: str = "buy" if delta > 0 else "sell"

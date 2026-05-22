@@ -164,6 +164,44 @@ def test_idempotency_keys_deterministic():
     assert o1.client_order_id == o2.client_order_id
 
 
+def test_crypto_dust_uses_usd_floor_not_share_count(tmp_path=None):
+    """Regression for the 2026-05-22 chaos-bot bug: at $1000 equity * 25% sizing =
+    $250 of ETH, target qty = 0.089 ETH was being silently dropped because
+    abs(0.089) < 1.0. Crypto must use a $-notional floor, not the share-count one."""
+    orders = reconcile(
+        targets={"ETH/USD": 1.0},
+        bot_positions={"ETH/USD": 0.0},
+        prices={"ETH/USD": 2800.0},
+        equity_for_sizing=1000.0,
+        max_position_pct=0.25,
+        asset_classes={"ETH/USD": "crypto"},
+        strategy_name="chaos",
+        bar_ts_ms=1_700_000_000_000,
+    )
+    assert len(orders) == 1, "ETH order silently dropped — dust filter is wrong for crypto"
+    assert orders[0].symbol == "ETH/USD"
+    assert orders[0].side == "buy"
+    # qty ≈ 250 / 2800 = 0.0892857...
+    assert 0.08 < orders[0].qty < 0.10
+
+
+def test_crypto_dust_does_drop_sub_5_usd_orders():
+    """The new $5 crypto dust threshold should still drop truly tiny orders."""
+    # Target weight tiny → ~$0.50 of BTC at $76k → 0.0000066 BTC. Below $5 floor.
+    orders = reconcile(
+        targets={"BTC/USD": 0.002},   # 0.2% weight, capped further by max_position_pct
+        bot_positions={"BTC/USD": 0.0},
+        prices={"BTC/USD": 76_000.0},
+        equity_for_sizing=1000.0,
+        max_position_pct=0.25,
+        asset_classes={"BTC/USD": "crypto"},
+        strategy_name="chaos",
+        bar_ts_ms=1_700_000_000_000,
+    )
+    # 0.002 weight * $1000 equity = $2 worth → 0.0000263 BTC → $2 < $5 dust floor → drop
+    assert orders == []
+
+
 def test_idempotency_keys_differ_per_bar():
     common = dict(
         targets={"SPY": 1.0},
